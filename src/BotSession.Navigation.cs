@@ -595,7 +595,9 @@ internal sealed partial class BotSession
                             return BotToolResult.Fail("No current simulator available.");
                         }
                         
-                        uint localId;
+                        // CHECK i really think this is not useful any more, if it ever was
+                        uint localId = 0;
+                        
                         string label;
                         var trackedId = UUID.Zero;
                         string? monitorHandle = null;
@@ -605,21 +607,19 @@ internal sealed partial class BotSession
                             if (UUID.TryParse(trimmedTarget, out var explicitTargetId) && explicitTargetId != UUID.Zero)
                             {
                                 trackedId = explicitTargetId;
-                                localId = 0;
-                                label = trackedId.ToString();
-
-                                // If currently visible, prefer a friendly label and local ID.
-                                if (TryResolveAvatarAcrossSims(client, trimmedTarget, out var resolvedSim, out var resolvedLocalId, out var resolvedLabel, out var _ignoredAvatarId))
-                                {
-                                    sim = resolvedSim;
-                                    localId = resolvedLocalId;
-                                    label = resolvedLabel;
-                                }
+                                label = await _agentLocator.ResolveAgentNameByIdAsync(trackedId, taskCancellationToken).ConfigureAwait(false)
+                                    ?? trackedId.ToString();
                             }
-                            else if (!TryResolveAvatarAcrossSims(client, target, out sim, out localId, out label, out trackedId))
+                            else 
                             {
-                                return BotToolResult.Fail(
-                                    $"Avatar '{target}' not found in visible simulators. Use full name or UUID.");
+                                var resolved = await _agentLocator.ResolveAgentIdByNameAsync(trimmedTarget, taskCancellationToken).ConfigureAwait(false);
+                                if (!resolved.Ok || resolved.AgentId == UUID.Zero)
+                                {
+                                    return BotToolResult.Fail(resolved.ErrorMessage ?? $"Avatar '{trimmedTarget}' could not be resolved.");
+                                }
+
+                                trackedId = resolved.AgentId;
+                                label = trimmedTarget;
                             }
 
                             monitorHandle = (await _agentLocator.MonitorAgent(trackedId.ToString(), taskCancellationToken).ConfigureAwait(false)).Handle;
@@ -1625,43 +1625,6 @@ internal sealed partial class BotSession
         return true;
     }
 
-    private static bool TryResolveAvatarAcrossSims(
-        GridClient client,
-        string target,
-        out Simulator resolvedSim,
-        out uint localId,
-        out string label,
-        out UUID avatarId)
-    {
-        localId = 0;
-        label = string.Empty;
-        avatarId = UUID.Zero;
-
-        var current = client.Network.CurrentSim;
-        if (current != null && TryResolveAvatar(current, target, out localId, out label, out avatarId))
-        {
-            resolvedSim = current;
-            return true;
-        }
-
-        foreach (var candidate in client.Network.Simulators)
-        {
-            if (ReferenceEquals(candidate, current))
-            {
-                continue;
-            }
-
-            if (TryResolveAvatar(candidate, target, out localId, out label, out avatarId))
-            {
-                resolvedSim = candidate;
-                return true;
-            }
-        }
-
-        resolvedSim = current ?? client.Network.Simulators.FirstOrDefault() ?? throw new InvalidOperationException("No simulator available.");
-        return false;
-    }
-
     private void EmitFollowProgressEvent(
         string handle,
         string eventType,
@@ -1840,41 +1803,6 @@ internal sealed partial class BotSession
                 error = "Unsupported axis. Use: forward, back, left, right, up, down.";
                 return false;
         }
-    }
-
-    private static bool TryResolveAvatar(Simulator sim, string target, out uint localId, out string label, out UUID avatarId)
-    {
-        localId = 0;
-        label = string.Empty;
-        avatarId = UUID.Zero;
-
-        if (UUID.TryParse(target, out var uuid))
-        {
-            var match = sim.ObjectsAvatars.FirstOrDefault(kvp => kvp.Value.ID == uuid);
-            if (match.Value != null)
-            {
-                localId = match.Value.LocalID;
-                label = $"{match.Value.Name} ({match.Value.ID})";
-                avatarId = match.Value.ID;
-                return true;
-            }
-
-            return false;
-        }
-
-        var byName = sim.ObjectsAvatars.FirstOrDefault(kvp =>
-            kvp.Value != null
-            && !string.IsNullOrWhiteSpace(kvp.Value.Name)
-            && kvp.Value.Name.Equals(target.Trim(), StringComparison.OrdinalIgnoreCase));
-        if (byName.Value != null)
-        {
-            localId = byName.Value.LocalID;
-            label = $"{byName.Value.Name} ({byName.Value.ID})";
-            avatarId = byName.Value.ID;
-            return true;
-        }
-
-        return false;
     }
 
     private static bool TryResolveObject(Simulator sim, string target, out uint localId, out string label)

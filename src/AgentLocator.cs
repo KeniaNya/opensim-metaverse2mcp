@@ -13,6 +13,8 @@ internal sealed class AgentLocator
     private static readonly TimeSpan MonitorDelayOnlineDifferentSim = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan FriendMapTimeout = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan AvatarNameSearchTimeout = TimeSpan.FromSeconds(12);
+    private static readonly TimeSpan AvatarUuidNameLookupTimeout = TimeSpan.FromSeconds(6);
+    private static readonly TimeSpan AgentIdentityCacheTtl = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan SingleSnapshotFriendMapTimeout = TimeSpan.FromSeconds(1.5);
     private static readonly TimeSpan ExternalFallbackProbeInterval = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan CoarsePresenceFreshnessWindow = TimeSpan.FromSeconds(20);
@@ -51,6 +53,8 @@ internal sealed class AgentLocator
     private SpawnerLocatedAgent? _cachedExternalFallbackResult;
     private readonly ConcurrentDictionary<string, AgentMonitorSnapshot> _latestStatusByHandle = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<ulong, CoarsePresenceSnapshot> _latestCoarsePresenceByRegionHandle = new();
+    private readonly ConcurrentDictionary<string, CachedIdentityValue<UUID>> _agentIdByNameCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<UUID, CachedIdentityValue<string>> _agentNameByIdCache = new();
     private DateTime _lastExternalProbeAtUtc = DateTime.MinValue;
 
     public AgentLocator(BotSession bot, SpawnerClient spawnerClient)
@@ -223,29 +227,48 @@ internal sealed class AgentLocator
         return _latestStatusByHandle.TryGetValue(monitorHandle.Trim(), out snapshot!);
     }
 
-    public async Task<(bool Ok, UUID AgentId, string? ErrorMessage)> ResolveAgentIdByNameAsync(
+    public async Task<AgentResolutionResult> ResolveAgentIdByNameAsync(
         string first,
         string last,
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(first) || string.IsNullOrWhiteSpace(last))
         {
-            return (false, UUID.Zero, "first and last are required.");
+            return new AgentResolutionResult(false, UUID.Zero, "first and last are required.");
         }
         var normalizedFirst = first.Trim();
         var normalizedLast = last.Trim();
         var query = $"{normalizedFirst} {normalizedLast}";
 
+        return await ResolveAgentIdByNameAsync(query, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<AgentResolutionResult> ResolveAgentIdByNameAsync(
+        string query,
+        CancellationToken cancellationToken)
+    {
+        var normalizedQuery = NormalizeAvatarName(query);
+        if (string.IsNullOrWhiteSpace(normalizedQuery))
+        {
+            return new AgentResolutionResult(false, UUID.Zero, "query is required.");
+        }
+
+        if (TryGetCachedAgentIdByName(normalizedQuery, out var cachedId))
+        {
+            return new AgentResolutionResult(true, cachedId, null);
+        }
+
         if (!_bot.TryGetConnectedClientSnapshot(out var connectedClient) || connectedClient == null)
         {
-            return (false, UUID.Zero, "No connected client snapshot available for avatar name search.");
+            return new AgentResolutionResult(false, UUID.Zero, "No connected client snapshot available for avatar name search.");
         }
 
         var queryId = UUID.Random();
-        var reply = await WaitForAvatarPickerReplyAsync(connectedClient, query, queryId, AvatarNameSearchTimeout, cancellationToken).ConfigureAwait(false);
+        var reply = await WaitForAvatarPickerReplyAsync(connectedClient, normalizedQuery, queryId, AvatarNameSearchTimeout, cancellationToken)
+            .ConfigureAwait(false);
         if (reply == null)
         {
-            return (false, UUID.Zero, $"Timed out waiting for avatar name search reply for '{query}'.");
+            return new AgentResolutionResult(false, UUID.Zero, $"Timed out waiting for avatar name search reply for '{normalizedQuery}'.");
         }
 
         foreach (var candidate in reply.Avatars)
@@ -255,13 +278,123 @@ internal sealed class AgentLocator
                 continue;
             }
 
-            if (string.Equals(candidate.Value, query, StringComparison.OrdinalIgnoreCase))
+            var candidateName = NormalizeAvatarName(candidate.Value);
+            if (string.Equals(candidateName, normalizedQuery, StringComparison.OrdinalIgnoreCase))
             {
-                return (true, candidate.Key, null);
+                CacheResolvedIdentity(candidate.Key, candidateName);
+                return new AgentResolutionResult(true, candidate.Key, null);
             }
         }
 
-        return (false, UUID.Zero, $"Agent '{query}' could not be found.");
+        return new AgentResolutionResult(false, UUID.Zero, $"Agent '{normalizedQuery}' could not be found.");
+    }
+
+    public async Task<string?> ResolveAgentNameByIdAsync(
+        UUID agentId,
+        CancellationToken cancellationToken)
+    {
+        if (agentId == UUID.Zero)
+        {
+            return null;
+        }
+
+        if (TryGetCachedAgentNameById(agentId, out var cachedName))
+        {
+            return cachedName;
+        }
+
+        if (!_bot.TryGetConnectedClientSnapshot(out var connectedClient) || connectedClient == null)
+        {
+            return null;
+        }
+
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        void Handler(object? _, UUIDNameReplyEventArgs e)
+        {
+            if (e.Names.TryGetValue(agentId, out var resolved) && !string.IsNullOrWhiteSpace(resolved))
+            {
+                tcs.TrySetResult(NormalizeAvatarName(resolved));
+            }
+        }
+
+        connectedClient.Avatars.UUIDNameReply += Handler;
+        try
+        {
+            connectedClient.Avatars.RequestAvatarName(agentId);
+            var timeoutTask = Task.Delay(AvatarUuidNameLookupTimeout, cancellationToken);
+            var completed = await Task.WhenAny(tcs.Task, timeoutTask).ConfigureAwait(false);
+            if (completed != tcs.Task)
+            {
+                return null;
+            }
+
+            var resolved = await tcs.Task.ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(resolved))
+            {
+                CacheResolvedIdentity(agentId, resolved);
+            }
+
+            return resolved;
+        }
+        finally
+        {
+            connectedClient.Avatars.UUIDNameReply -= Handler;
+        }
+    }
+
+    private bool TryGetCachedAgentIdByName(string normalizedName, out UUID agentId)
+    {
+        if (_agentIdByNameCache.TryGetValue(normalizedName, out var entry) && entry.ExpiresAtUtc > DateTime.UtcNow)
+        {
+            agentId = entry.Value;
+            return true;
+        }
+
+        _agentIdByNameCache.TryRemove(normalizedName, out _);
+        agentId = UUID.Zero;
+        return false;
+    }
+
+    private bool TryGetCachedAgentNameById(UUID agentId, out string? name)
+    {
+        if (_agentNameByIdCache.TryGetValue(agentId, out var entry) && entry.ExpiresAtUtc > DateTime.UtcNow)
+        {
+            name = entry.Value;
+            return true;
+        }
+
+        _agentNameByIdCache.TryRemove(agentId, out _);
+        name = null;
+        return false;
+    }
+
+    private void CacheResolvedIdentity(UUID agentId, string fullName)
+    {
+        if (agentId == UUID.Zero)
+        {
+            return;
+        }
+
+        var normalizedName = NormalizeAvatarName(fullName);
+        if (string.IsNullOrWhiteSpace(normalizedName))
+        {
+            return;
+        }
+
+        var expiresAtUtc = DateTime.UtcNow + AgentIdentityCacheTtl;
+        _agentNameByIdCache[agentId] = new CachedIdentityValue<string>(normalizedName, expiresAtUtc);
+        _agentIdByNameCache[normalizedName] = new CachedIdentityValue<UUID>(agentId, expiresAtUtc);
+    }
+
+    private static string NormalizeAvatarName(string? avatarName)
+    {
+        if (string.IsNullOrWhiteSpace(avatarName))
+        {
+            return string.Empty;
+        }
+
+        return string.Join(' ', avatarName.Split(' ', StringSplitOptions.RemoveEmptyEntries));
     }
 
     private static async Task<AvatarPickerReplyEventArgs?> WaitForAvatarPickerReplyAsync(
@@ -1120,7 +1253,16 @@ internal sealed class AgentLocator
     {
         public static AgentMonitorStatus Unknown { get; } = new(null, null, null, null, null, null, null, null);
     }
+
+    private sealed record CachedIdentityValue<T>(
+        T Value,
+        DateTime ExpiresAtUtc);
 }
+
+internal sealed record AgentResolutionResult(
+    bool Ok,
+    UUID AgentId,
+    string? ErrorMessage);
 
 internal sealed record AgentMonitorSnapshot(
     UUID TargetId,

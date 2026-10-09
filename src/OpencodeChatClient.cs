@@ -97,88 +97,96 @@ internal sealed class OpencodeChatClient : IHarnessClient, IDisposable
         {
             return;
         }
+        
+        Console.WriteLine($"[opencode:event] starting event-stream observer for endpoint={endpoint}");
 
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            try
+        try {
+            while (!cancellationToken.IsCancellationRequested)
             {
-                using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
-                using var response = await _eventHttp.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
-                if (!response.IsSuccessStatusCode)
+                try
                 {
-                    var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-                    Console.WriteLine($"[opencode:event] connect failed endpoint={endpoint} status={(int)response.StatusCode} {response.StatusCode} body={TruncateForLog(body, 240)}");
+                    using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
+                    using var response = await _eventHttp.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                        Console.WriteLine($"[opencode:event] connect failed endpoint={endpoint} status={(int)response.StatusCode} {response.StatusCode} body={TruncateForLog(body, 240)}");
+                        await Task.Delay(2000, cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
+    
+                    using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+                    using var reader = new StreamReader(stream);
+    
+                    var currentEventName = "message";
+                    var dataBuilder = new StringBuilder();
+    
+                    while (!cancellationToken.IsCancellationRequested)
+                    {
+                        var line = await reader.ReadLineAsync().ConfigureAwait(false);
+                        if (line == null)
+                        {
+                            break;
+                        }
+    
+                        if (line.Length == 0)
+                        {
+                            if (dataBuilder.Length > 0)
+                            {
+                                ProcessObservedEvent(currentEventName, dataBuilder.ToString());
+                            }
+    
+                            currentEventName = "message";
+                            dataBuilder.Clear();
+                            continue;
+                        }
+    
+                        if (line[0] == ':')
+                        {
+                            continue;
+                        }
+    
+                        if (line.StartsWith("event:", StringComparison.OrdinalIgnoreCase))
+                        {
+                            currentEventName = line[6..].Trim();
+                            continue;
+                        }
+    
+                        if (line.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var chunk = line[5..].TrimStart();
+                            if (dataBuilder.Length > 0)
+                            {
+                                dataBuilder.Append('\n');
+                            }
+    
+                            dataBuilder.Append(chunk);
+                        }
+                    }
+    
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[opencode:event] stream error endpoint={endpoint}: {ex.Message}");
+                }
+    
+                try
+                {
                     await Task.Delay(2000, cancellationToken).ConfigureAwait(false);
-                    continue;
                 }
-
-                using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-                using var reader = new StreamReader(stream);
-
-                var currentEventName = "message";
-                var dataBuilder = new StringBuilder();
-
-                while (!cancellationToken.IsCancellationRequested)
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    var line = await reader.ReadLineAsync().ConfigureAwait(false);
-                    if (line == null)
-                    {
-                        break;
-                    }
-
-                    if (line.Length == 0)
-                    {
-                        if (dataBuilder.Length > 0)
-                        {
-                            ProcessObservedEvent(currentEventName, dataBuilder.ToString());
-                        }
-
-                        currentEventName = "message";
-                        dataBuilder.Clear();
-                        continue;
-                    }
-
-                    if (line[0] == ':')
-                    {
-                        continue;
-                    }
-
-                    if (line.StartsWith("event:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        currentEventName = line[6..].Trim();
-                        continue;
-                    }
-
-                    if (line.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var chunk = line[5..].TrimStart();
-                        if (dataBuilder.Length > 0)
-                        {
-                            dataBuilder.Append('\n');
-                        }
-
-                        dataBuilder.Append(chunk);
-                    }
+                    return;
                 }
-
             }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[opencode:event] stream error endpoint={endpoint}: {ex.Message}");
-            }
-
-            try
-            {
-                await Task.Delay(2000, cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                return;
-            }
+        }
+        finally
+        {
+            Console.WriteLine($"[opencode:event] stopping event-stream observer for endpoint={endpoint}");
         }
     }
 
