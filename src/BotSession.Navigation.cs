@@ -16,8 +16,6 @@ internal sealed partial class BotSession {
     private const float CrossRegionWaypointMinLocal = -64f;
     private const float CrossRegionWaypointMaxLocal = 320f;
     private static readonly TimeSpan CrossRegionMovementReissueInterval = TimeSpan.FromMilliseconds(250);
-    private static readonly TimeSpan DirectionalUpdateKeepaliveInterval = TimeSpan.FromMilliseconds(700);
-    private const float DirectionalTurnRetargetDistanceMeters = 0.9f;
     private readonly object _movementLock = new();
     private CancellationTokenSource? _movementAutoStopCts;
     private string? _activeFollowTaskHandle;
@@ -28,7 +26,6 @@ internal sealed partial class BotSession {
     private bool? _lastDirectionalUpPos;
     private bool? _lastDirectionalUpNeg;
     private bool? _lastDirectionalFastUp;
-    private DateTime _lastDirectionalUpdateAt = DateTime.MinValue;
 
     private enum FollowMode
     {
@@ -1692,7 +1689,6 @@ internal sealed partial class BotSession {
         _lastDirectionalUpPos = null;
         _lastDirectionalUpNeg = null;
         _lastDirectionalFastUp = null;
-        _lastDirectionalUpdateAt = DateTime.MinValue;
     }
 
     private bool ApplyFollowDirectionalControls(
@@ -1713,8 +1709,8 @@ internal sealed partial class BotSession {
         var delta = targetPos - client.Self.SimPosition;
         var distance2D = MathF.Sqrt((delta.X * delta.X) + (delta.Y * delta.Y));
 
-        // For cross-region movement, derive facing from world-space direction and then
-        // project back into a valid local target to avoid heading inversions near seams.
+        // For cross-region movement, derive facing from world-space direction.
+        // Keep this unclamped so west/south seam crossings do not flip heading backward.
         var currentSim = client.Network.CurrentSim;
         if (targetRegionHandle.HasValue
             && targetRegionLocal.HasValue
@@ -1730,21 +1726,17 @@ internal sealed partial class BotSession {
             {
                 var headingDir = Vector3.Normalize(planarWorldDelta);
                 var projectedTurnTarget = client.Self.SimPosition + (headingDir * 8.0f);
-                turnTargetUsed = ClampEdgeWaypoint(projectedTurnTarget);
+                turnTargetUsed = projectedTurnTarget;
             }
         }
 
         var shouldMoveForward = distance2D > 0.35f;
 
-        // Avoid visible reorientation churn while briefly paused inside follow tolerance.
+        // Strict mode: while moving, continuously face the current movement direction.
         if (shouldMoveForward)
         {
-            if (!_lastDirectionalTurnTarget.HasValue
-                || Vector3.Distance(_lastDirectionalTurnTarget.Value, turnTargetUsed) >= DirectionalTurnRetargetDistanceMeters)
-            {
-                movement.TurnToward(turnTargetUsed, sendUpdate: false);
-                _lastDirectionalTurnTarget = turnTargetUsed;
-            }
+            movement.TurnToward(turnTargetUsed, sendUpdate: false);
+            _lastDirectionalTurnTarget = turnTargetUsed;
         }
 
         movement.AtPos = shouldMoveForward;
@@ -1773,15 +1765,9 @@ internal sealed partial class BotSession {
             || _lastDirectionalUpNeg != movement.UpNeg
             || _lastDirectionalFastUp != movement.FastUp;
 
-        var now = DateTime.UtcNow;
-        var keepaliveDue = shouldMoveForward
-            && (_lastDirectionalUpdateAt == DateTime.MinValue
-                || (now - _lastDirectionalUpdateAt) >= DirectionalUpdateKeepaliveInterval);
-
-        if (directionalStateChanged || keepaliveDue)
+        if (directionalStateChanged || shouldMoveForward)
         {
             movement.SendUpdate(true);
-            _lastDirectionalUpdateAt = now;
             _lastDirectionalAtPos = movement.AtPos;
             _lastDirectionalUpPos = movement.UpPos;
             _lastDirectionalUpNeg = movement.UpNeg;
