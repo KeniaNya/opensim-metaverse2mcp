@@ -3,18 +3,32 @@ using LibreMetaverse;
 
 namespace Opensim.Metaverse2Mcp;
 
-internal sealed partial class BotSession
-{
+internal sealed partial class BotSession {
+
+    private static readonly int CROSS_REGION_STALL = 31;
     private static readonly string[] DoorHintKeywords = new[] { "door", "gate", "entry", "entrance", "open", "lobby" };
-    
+
     private const float WalkProgressThresholdMeters = 1.5f;
     private const float WalkStuckWindowSeconds = 6f;
     private const int WalkRecoveryMaxAttempts = 5;
     private const bool EnableWalkTeleportFallback = true;
+    private const float CrossRegionSeamOvershootMeters = 8f;
+    private const float CrossRegionWaypointMinLocal = -64f;
+    private const float CrossRegionWaypointMaxLocal = 320f;
+    private static readonly TimeSpan CrossRegionMovementReissueInterval = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan DirectionalUpdateKeepaliveInterval = TimeSpan.FromMilliseconds(700);
+    private const float DirectionalTurnRetargetDistanceMeters = 0.9f;
     private readonly object _movementLock = new();
     private CancellationTokenSource? _movementAutoStopCts;
     private string? _activeFollowTaskHandle;
     private string? _activeFollowMonitorTaskHandle;
+    private FollowMode? lastAppliedLocomotionMode = null;
+    private Vector3? _lastDirectionalTurnTarget;
+    private bool? _lastDirectionalAtPos;
+    private bool? _lastDirectionalUpPos;
+    private bool? _lastDirectionalUpNeg;
+    private bool? _lastDirectionalFastUp;
+    private DateTime _lastDirectionalUpdateAt = DateTime.MinValue;
 
     private enum FollowMode
     {
@@ -631,7 +645,7 @@ internal sealed partial class BotSession
                         }
 
                         resolution = new FollowResolution(client, sim, isObject, trackedId, localId, label, monitorHandle);
-                        StartFollowLoop(taskHandle.Handle, monitorHandle, client, sim, isObject, trackedId, localId, label);
+                        SetupFollowLoop(taskHandle.Handle, monitorHandle, client, sim, isObject, trackedId, localId, label);
                         return BotToolResult.OkResult($"Following {targetType} {label} (buffer {buffer:F1}m).");
                     }, taskCancellationToken).ConfigureAwait(false);
 
@@ -696,7 +710,7 @@ internal sealed partial class BotSession
         string Label,
         string? MonitorHandle);
 
-    private void StartFollowLoop(string followTaskHandle, string? monitorTaskHandle, GridClient client, Simulator sim, bool isObject, UUID trackedId, uint localId, string label)
+    private void SetupFollowLoop(string followTaskHandle, string? monitorTaskHandle, GridClient client, Simulator sim, bool isObject, UUID trackedId, uint localId, string label)
     {
         StopFollowInternal();
         lock (_movementLock)
@@ -734,100 +748,53 @@ internal sealed partial class BotSession
         var teleportRequestSent = false;
         ulong lastKnownCrossRegionHandle = 0;
         var lastKnownCrossRegionLocal = Vector3.Zero;
+        ulong seamLockTargetHandle = 0;
+        bool? seamLockPushEastWest = null;
+        var seamLockDirection = 0;
         var followStartRegionHandle = followSetup.Simulator.Handle;
         var followStartLocal = ClampLocalPosition(client.Self.SimPosition);
         var avatarLost = false;
         var targetStationary = false;
         var followMovementMode = FollowMode.None;
         bool? lastLoggedTargetFlying = null;
-        FollowMode? lastAppliedLocomotionMode = null;
         var sameRegionBestDistance = float.MaxValue;
         var sameRegionLastProgressAt = DateTime.UtcNow;
         var sameRegionRecoveryAttempts = 0;
         var sameRegionLastRecoveryAt = DateTime.MinValue;
-        var crossingMovementPaused = false;
+        var lastObservedCrossingState = AgentManager.CrossingState.Idle;
+        var observedCrossingStateSince = DateTime.UtcNow;
 
-        // Stage 1: Apply locomotion mode deltas only when required.
-        // This keeps network updates lower and avoids control-flag churn.
-        static FollowMode ResolveLocomotionControlMode(FollowMode mode)
-            => mode switch
-            {
-                FollowMode.Running or FollowMode.RunningToBorder => FollowMode.Running,
-                FollowMode.Flying or FollowMode.FlyingToBorder => FollowMode.Flying,
-                _ => FollowMode.Walking
-            };
-
-        static bool IsCrossRegionPhase(FollowMode mode)
-            => mode is FollowMode.WalkingToBorder
-                or FollowMode.RunningToBorder
-                or FollowMode.FlyingToBorder
-                or FollowMode.TeleportingToTarget
-                or FollowMode.AwaitingTeleportAssist;
-
-        static bool IsBorderWalkPhase(FollowMode mode)
-            => mode is FollowMode.WalkingToBorder
-                or FollowMode.RunningToBorder
-                or FollowMode.FlyingToBorder;
-
-        static bool IsViewerCrossingInProgress(AgentManager.CrossingState state)
-            => state is AgentManager.CrossingState.PreparingCross
-                or AgentManager.CrossingState.Connecting
-                or AgentManager.CrossingState.WaitingForComplete
-                or AgentManager.CrossingState.Recovering;
-
-        static FollowMode ResolveBorderFollowMode(FollowMode currentMode, FollowMode fallbackMode)
-            => ResolveLocomotionControlMode(currentMode) switch
-            {
-                FollowMode.Running => FollowMode.RunningToBorder,
-                FollowMode.Flying => FollowMode.FlyingToBorder,
-                _ => ResolveLocomotionControlMode(fallbackMode) switch
-                {
-                    FollowMode.Running => FollowMode.RunningToBorder,
-                    FollowMode.Flying => FollowMode.FlyingToBorder,
-                    _ => FollowMode.WalkingToBorder
-                }
-            };
-
-        void ApplyFollowLocomotionMode(FollowMode locomotionModeDesired)
+        void ResetSeamLock()
         {
-            var controlMode = ResolveLocomotionControlMode(locomotionModeDesired);
-            if (lastAppliedLocomotionMode == controlMode)
+            seamLockTargetHandle = 0;
+            seamLockPushEastWest = null;
+            seamLockDirection = 0;
+        }
+
+        void AcquireSeamLock(Simulator botSimulator, Vector3 botLocalPosition, ulong targetHandle, Vector3 targetLocalPosition, string reason)
+        {
+            if (targetHandle == 0)
             {
                 return;
             }
 
-            switch (controlMode)
-            {
-                case FollowMode.Flying:
-                    client.Self.Fly(true);
-                    client.Self.Movement.FastAt = false;
-                    client.Self.Movement.FastLeft = false;
-                    client.Self.Movement.AlwaysRun = false;
-                    client.Self.Movement.SendUpdate(true);
-                    break;
-                case FollowMode.Running:
-                    client.Self.Fly(false);
-                    client.Self.Movement.FastAt = true;
-                    client.Self.Movement.FastLeft = true;
-                    client.Self.Movement.AlwaysRun = true;
-                    client.Self.Movement.SendUpdate(true);
-                    break;
-                default:
-                    client.Self.Fly(false);
-                    client.Self.Movement.FastAt = false;
-                    client.Self.Movement.FastLeft = false;
-                    client.Self.Movement.AlwaysRun = false;
-                    client.Self.Movement.SendUpdate(true);
-                    break;
-            }
+            var botGlobal = ToGlobalPosition(botSimulator.Handle, botLocalPosition);
+            var targetGlobal = ToGlobalPosition(targetHandle, targetLocalPosition);
+            var globalDelta = targetGlobal - botGlobal;
+            var pushEastWest = MathF.Abs(globalDelta.X) >= MathF.Abs(globalDelta.Y);
+            var direction = pushEastWest
+                ? (globalDelta.X >= 0f ? 1 : -1)
+                : (globalDelta.Y >= 0f ? 1 : -1);
+
+            seamLockTargetHandle = targetHandle;
+            seamLockPushEastWest = pushEastWest;
+            seamLockDirection = direction;
 
             if (IsFollowDiagnosticsEnabled())
             {
                 Console.WriteLine(
-                    $"[follow][runmode] controls_applied target={label} requestedMode={locomotionModeDesired} appliedLocomotion={controlMode} fastAt={client.Self.Movement.FastAt} fastLeft={client.Self.Movement.FastLeft} flyNow={client.Self.Movement.Fly} alwaysRunNow={client.Self.Movement.AlwaysRun}");
+                    $"[follow][diag] seam_lock_acquired target={label} reason={reason} targetHandle={targetHandle} axis={(pushEastWest ? "x" : "y")} direction={(direction >= 0 ? "+" : "-")} botPos={FormatPosition(botLocalPosition)} targetLocal={FormatPosition(targetLocalPosition)} deltaGlobal={FormatPosition(globalDelta)}");
             }
-
-            lastAppliedLocomotionMode = controlMode;
         }
 
         // Stage 2: Hard-stop helper for hold states and cleanup transitions.
@@ -858,6 +825,7 @@ internal sealed partial class BotSession
                 client.Self.Fly(true);
             }
             client.Self.Movement.SendUpdate(true);
+            ClearDirectionalFollowCache();
             followMovementMode = desiredStopMode;
             // Reset applied locomotion cache because ResetControlFlags clears run/strafe bits.
             lastAppliedLocomotionMode = null;
@@ -892,6 +860,60 @@ internal sealed partial class BotSession
                             $"[follow][diag] stop reason=no_current_sim target={label} lastTargetSim={DescribeSimulator(targetSim)}");
                     }
                     break;
+                }
+
+                var crossingState = client.Self.GetCrossingState();
+                if (crossingState != lastObservedCrossingState)
+                {
+                    var now = DateTime.UtcNow;
+                    var previousStateDuration = now - observedCrossingStateSince;
+                    if (IsFollowDiagnosticsEnabled())
+                    {
+                        Console.WriteLine(
+                            $"[follow][diag] crossing_state_change target={label} from={lastObservedCrossingState} to={crossingState} priorStateSeconds={previousStateDuration.TotalSeconds:F2} botSim={DescribeSimulator(botSim)}");
+                    }
+
+                    lastObservedCrossingState = crossingState;
+                    observedCrossingStateSince = now;
+                }
+                if (IsFollowDiagnosticsEnabled())
+                {
+                    Console.WriteLine(
+                        $"[follow][diag] crossingState={crossingState} target={label} botSim={DescribeSimulator(botSim)} targetSim={DescribeSimulator(targetSim)}");
+                }
+                if (crossingState == AgentManager.CrossingState.Failed)
+                {
+                    var stopMessage = $"Viewer crossing entered Failed while following {label}; stopping follow immediately to avoid unstable recovery movement.";
+                    Console.WriteLine($"[follow] {stopMessage}");
+                    EmitFollowProgressEvent(
+                        followTaskHandle,
+                        "follow.crossing.failed",
+                        stopMessage,
+                        new Dictionary<string, string?>
+                        {
+                            ["crossingState"] = crossingState.ToString(),
+                            ["botSim"] = DescribeSimulator(botSim)
+                        });
+                    completion = BotToolResult.Fail(stopMessage);
+                    break;
+                }
+
+                if (IsViewerCrossingInProgress(crossingState))
+                {
+                    // Let LMV crossing complete without follow-side movement, cancel, teleport, or recovery actions.
+                    if (IsFollowDiagnosticsEnabled() && (DateTime.UtcNow - lastDiagAt) >= TimeSpan.FromSeconds(3))
+                    {
+                        var movement = client.Self.Movement;
+                        var crossingStateAge = DateTime.UtcNow - observedCrossingStateSince;
+                        var lastPilotAge = DateTime.UtcNow - lastPilotAt;
+                        Console.WriteLine(
+                            $"[follow][diag] crossing_active target={label} crossingState={crossingState} stateAgeSeconds={crossingStateAge.TotalSeconds:F2} followMode={followMovementMode} botSim={DescribeSimulator(botSim)} movementFlags=AtPos:{movement.AtPos} AtNeg:{movement.AtNeg} LeftPos:{movement.LeftPos} LeftNeg:{movement.LeftNeg} UpPos:{movement.UpPos} UpNeg:{movement.UpNeg} FastAt:{movement.FastAt} FastLeft:{movement.FastLeft} FastUp:{movement.FastUp} Fly:{movement.Fly} lastMovementCommandMs={lastPilotAge.TotalMilliseconds:F0}");
+                        lastDiagAt = DateTime.UtcNow;
+                    }
+
+                    lastCrossRegionProgressAt = DateTime.UtcNow;
+                        
+                    continue;
                 }
 
                 Vector3 targetPos;
@@ -991,16 +1013,23 @@ internal sealed partial class BotSession
                         lastKnownCrossRegionHandle = statusRegionHandle;
                         lastKnownCrossRegionLocal = statusPosition;
 
+                        var hasSeamLock = seamLockTargetHandle == statusRegionHandle
+                            && seamLockPushEastWest.HasValue
+                            && seamLockDirection != 0;
+
                         targetPos = ResolveFollowWaypointFromRegionHandle(
                             botSim,
                             client.Self.SimPosition,
                             statusRegionHandle,
                             statusPosition,
                             out distance,
-                            out targetIsCrossRegion);
+                            out targetIsCrossRegion,
+                            hasSeamLock ? seamLockPushEastWest : null,
+                            hasSeamLock ? seamLockDirection : 0);
 
                         var deltaZ = MathF.Abs(statusPosition.Z - client.Self.SimPosition.Z);
-                        var runThreshold = MathF.Max(buffer + 1.5f, buffer * 1.6f);
+                        // Start running much earlier so the bot does not close too aggressively right near the target.
+                        var runThreshold = MathF.Max(buffer + 4.5f, buffer * 2.6f);
                         var flyCatchupThreshold = MathF.Max(runThreshold + 6f, buffer * 3f);
                         var flyCatchupZThreshold = 3.5f;
                         var beyondRunThreshold = distance > runThreshold;
@@ -1089,13 +1118,20 @@ internal sealed partial class BotSession
 
                         crossRegionTargetHandle = offRegionHandle;
                         crossRegionTargetLocal = lastKnownCrossRegionLocal;
+
+                        var hasSeamLock = seamLockTargetHandle == crossRegionTargetHandle
+                            && seamLockPushEastWest.HasValue
+                            && seamLockDirection != 0;
+
                         targetPos = ResolveFollowWaypointFromRegionHandle(
                             botSim,
                             client.Self.SimPosition,
                             crossRegionTargetHandle,
                             crossRegionTargetLocal,
                             out distance,
-                            out targetIsCrossRegion);
+                            out targetIsCrossRegion,
+                            hasSeamLock ? seamLockPushEastWest : null,
+                            hasSeamLock ? seamLockDirection : 0);
                     }
                 }
 
@@ -1107,41 +1143,22 @@ internal sealed partial class BotSession
                     lastDiagAt = DateTime.UtcNow;
                 }
 
-                var viewerCrossingInProgress = IsViewerCrossingInProgress(client.Self.GetCrossingState());
-
-                // Pause steering while the viewer crossing state-machine is active.
-                // This prevents follow/autopilot updates from fighting LMV crossing recovery.
-                if (viewerCrossingInProgress && targetIsCrossRegion)
-                {
-                    if (!crossingMovementPaused)
-                    {
-                        client.Self.AutoPilotCancel();
-                        client.Self.Movement.ResetControlFlags();
-                        client.Self.Movement.SendUpdate(true);
-                        lastAppliedLocomotionMode = null;
-                        crossingMovementPaused = true;
-
-                        if (IsFollowDiagnosticsEnabled())
-                        {
-                            Console.WriteLine(
-                                $"[follow][diag] crossing_pause target={label} crossingState={client.Self.GetCrossingState()} followMode={followMovementMode} botSim={DescribeSimulator(botSim)}");
-                        }
-                    }
-                }
-                else if (crossingMovementPaused)
-                {
-                    crossingMovementPaused = false;
-                    if (IsFollowDiagnosticsEnabled())
-                    {
-                        Console.WriteLine(
-                            $"[follow][diag] crossing_resume target={label} crossingState={client.Self.GetCrossingState()} followMode={followMovementMode} botSim={DescribeSimulator(botSim)}");
-                    }
-                }
-
                 if (targetIsCrossRegion)
                 {
                     // Stage 3e: Cross-region state machine.
                     // Walk to seam -> teleport attempts -> teleport assist.
+                    if (crossRegionTargetHandle != 0
+                        && seamLockTargetHandle != 0
+                        && seamLockTargetHandle != crossRegionTargetHandle)
+                    {
+                        AcquireSeamLock(
+                            botSim,
+                            client.Self.SimPosition,
+                            crossRegionTargetHandle,
+                            crossRegionTargetLocal,
+                            "target_handle_changed");
+                    }
+
                     if (crossRegionTargetHandle != 0)
                     {
                         lastKnownCrossRegionHandle = crossRegionTargetHandle;
@@ -1156,6 +1173,12 @@ internal sealed partial class BotSession
                         lastCrossRegionProgressAt = DateTime.UtcNow;
                         crossRegionTeleportAttempts = 0;
                         teleportRequestSent = false;
+                        AcquireSeamLock(
+                            botSim,
+                            client.Self.SimPosition,
+                            crossRegionTargetHandle,
+                            crossRegionTargetLocal,
+                            "cross_region_start");
                         
                         if (IsFollowDiagnosticsEnabled())
                         {
@@ -1166,7 +1189,7 @@ internal sealed partial class BotSession
                         EmitFollowProgressEvent(
                             followTaskHandle,
                             "follow.cross_region.walk_border",
-                            $"Target {label} moved cross-region; walking to border waypoint.");
+                            $"Target {label} moved cross-region; {followMovementMode} to border waypoint.");
                     }
                     else if ((lastCrossRegionDistance - distance) >= 1.0f)
                     {
@@ -1174,9 +1197,8 @@ internal sealed partial class BotSession
                         lastCrossRegionProgressAt = DateTime.UtcNow;
                     }
 
-                    if (!viewerCrossingInProgress
-                        && IsBorderWalkPhase(followMovementMode)
-                        && (DateTime.UtcNow - lastCrossRegionProgressAt) >= TimeSpan.FromSeconds(8))
+                    if (IsBorderWalkPhase(followMovementMode)
+                        && (DateTime.UtcNow - lastCrossRegionProgressAt) >= TimeSpan.FromSeconds(CROSS_REGION_STALL))
                     {
                         followMovementMode = FollowMode.TeleportingToTarget;
                         crossRegionStateSince = DateTime.UtcNow;
@@ -1195,8 +1217,7 @@ internal sealed partial class BotSession
                             $"Border pathing stalled while following {label}; attempting teleport.");
                     }
 
-                    if (!viewerCrossingInProgress
-                        && followMovementMode == FollowMode.TeleportingToTarget
+                    if (followMovementMode == FollowMode.TeleportingToTarget
                         && crossRegionTeleportAttempts < 2
                         && lastKnownCrossRegionHandle != 0)
                     {
@@ -1270,8 +1291,7 @@ internal sealed partial class BotSession
                         }
                     }
 
-                    if (!viewerCrossingInProgress
-                        && followMovementMode == FollowMode.AwaitingTeleportAssist
+                    if (followMovementMode == FollowMode.AwaitingTeleportAssist
                         && !teleportRequestSent
                         && followSetup.TrackedId != UUID.Zero)
                     {
@@ -1292,8 +1312,7 @@ internal sealed partial class BotSession
                             $"Requested teleport assist from {label}.");
                     }
 
-                    if (!viewerCrossingInProgress
-                        && followMovementMode == FollowMode.AwaitingTeleportAssist
+                    if (followMovementMode == FollowMode.AwaitingTeleportAssist
                         && crossRegionStateSince != DateTime.MinValue
                         && (DateTime.UtcNow - crossRegionStateSince) >= FollowTeleportAssistTimeout)
                     {
@@ -1323,19 +1342,17 @@ internal sealed partial class BotSession
                     // Stage 3f: Same-region reset path.
                     // Clear cross-region state and track local movement progress
                     // for anti-stall recovery.
-                    if (!viewerCrossingInProgress)
+                    if (IsCrossRegionPhase(followMovementMode))
                     {
-                        if (IsCrossRegionPhase(followMovementMode))
-                        {
-                            followMovementMode = FollowMode.None;
-                        }
-                        crossRegionStateSince = DateTime.MinValue;
-                        lastCrossRegionDistance = float.MaxValue;
-                        lastCrossRegionProgressAt = DateTime.UtcNow;
-                        crossRegionTeleportAttempts = 0;
-                        teleportRequestSent = false;
-                        lastKnownCrossRegionHandle = 0;
+                        followMovementMode = FollowMode.None;
                     }
+                    crossRegionStateSince = DateTime.MinValue;
+                    lastCrossRegionDistance = float.MaxValue;
+                    lastCrossRegionProgressAt = DateTime.UtcNow;
+                    crossRegionTeleportAttempts = 0;
+                    teleportRequestSent = false;
+                    lastKnownCrossRegionHandle = 0;
+                    ResetSeamLock();
 
                     if (distance < sameRegionBestDistance - FollowSameRegionProgressEpsilonMeters)
                     {
@@ -1364,11 +1381,10 @@ internal sealed partial class BotSession
                     // Stage 3g: Same-region anti-stall recovery.
                     // If we are in-region, far from target, and making no real
                     // progress for a while, perform controlled teleport recovery.
-                    if (!viewerCrossingInProgress
-                        && !targetIsCrossRegion
+                    if (!targetIsCrossRegion
                         && distance >= FollowSameRegionTeleportMinDistanceMeters
                         && (DateTime.UtcNow - sameRegionLastProgressAt) >= FollowSameRegionStuckWindow
-                        && (DateTime.UtcNow - sameRegionLastRecoveryAt) >= TimeSpan.FromSeconds(8)
+                        && (DateTime.UtcNow - sameRegionLastRecoveryAt) >= TimeSpan.FromSeconds(CROSS_REGION_STALL)
                         && sameRegionRecoveryAttempts < 2)
                     {
                         sameRegionRecoveryAttempts++;
@@ -1405,31 +1421,73 @@ internal sealed partial class BotSession
                     }
 
                     // Stage 3h: Normal movement command emission.
-                    // Re-issue movement at most once per second to avoid packet spam.
+                    // Re-issue movement frequently during seam pressure and at most once per second otherwise.
+                    var movementReissueInterval = targetIsCrossRegion
+                        ? CrossRegionMovementReissueInterval
+                        : TimeSpan.FromSeconds(1);
                     if (!holdPositionForTeleportAssist
-                        && !crossingMovementPaused
-                        && (DateTime.UtcNow - lastPilotAt) >= TimeSpan.FromSeconds(1))
+                        && (DateTime.UtcNow - lastPilotAt) >= movementReissueInterval)
                     {
                         var movementModeToApply = targetIsCrossRegion && IsCrossRegionPhase(followMovementMode)
                             ? followMovementMode
                             : locomotionModeDesired;
 
-                        ApplyFollowLocomotionMode(movementModeToApply);
+                        ApplyFollowLocomotionMode(client, movementModeToApply);
 
-                        if (targetIsCrossRegion && crossRegionTargetHandle != 0)
+                        if (targetIsCrossRegion)
                         {
-                            AutoPilotToRegionLocal(client, crossRegionTargetHandle, crossRegionTargetLocal);
+                            // Drive seam crossing with directional controls toward the projected waypoint.
+                            // targetPos is derived from target region handle/local and projected into this sim.
+                            client.Self.AutoPilotCancel();
+                            var directionalApplied = ApplyFollowDirectionalControls(
+                                client,
+                                targetPos,
+                                movementModeToApply,
+                                out var turnTargetUsed,
+                                crossRegionTargetHandle,
+                                crossRegionTargetLocal);
+                            if (IsFollowDiagnosticsEnabled())
+                            {
+                                Console.WriteLine(
+                                    $"[follow][diag] cross_region_directional target={label} targetHandle={crossRegionTargetHandle} targetLocal={FormatPosition(crossRegionTargetLocal)} waypoint={FormatPosition(targetPos)} turnTarget={FormatPosition(turnTargetUsed)} applied={directionalApplied}");
+                            }
+
+                            if (!directionalApplied)
+                            {
+                                followMovementMode = FollowMode.TeleportingToTarget;
+                                crossRegionStateSince = DateTime.UtcNow;
+
+                                EmitFollowProgressEvent(
+                                    followTaskHandle,
+                                    "follow.cross_region.teleport_attempt",
+                                    $"Directional cross-region movement unavailable while following {label}; moving to teleport phase.");
+                            }
                         }
                         else
                         {
-                            // Same-region follow is control-flag driven so fast/run flags
-                            // are emitted together with directional movement.
-                            if (!ApplyFollowDirectionalControls(client, targetPos, movementModeToApply))
+                            // Prefer autopilot for normal walking to reduce target bumping.
+                            if (IsWalkPhase(movementModeToApply))
                             {
+                                ClearDirectionalFollowCache();
                                 client.Self.AutoPilotLocal(
                                     (int)MathF.Round(targetPos.X),
                                     (int)MathF.Round(targetPos.Y),
                                     targetPos.Z);
+                            }
+                            else
+                            {
+                                // Clear any previous AutoPilot target before directional movement.
+                                // Without this, stale AutoPilot steering can override/compete with AtPos follow controls.
+                                client.Self.AutoPilotCancel();
+
+                                if (!ApplyFollowDirectionalControls(client, targetPos, movementModeToApply, out _))
+                                {
+                                    ClearDirectionalFollowCache();
+                                    client.Self.AutoPilotLocal(
+                                        (int)MathF.Round(targetPos.X),
+                                        (int)MathF.Round(targetPos.Y),
+                                        targetPos.Z);
+                                }
                             }
                         }
                         if (IsFollowDiagnosticsEnabled())
@@ -1469,6 +1527,7 @@ internal sealed partial class BotSession
             client.Self.AutoPilotCancel();
             client.Self.Movement.ResetControlFlags();
             client.Self.Movement.SendUpdate(true);
+            ClearDirectionalFollowCache();
         }
         catch
         {
@@ -1496,7 +1555,9 @@ internal sealed partial class BotSession
         ulong targetRegionHandle,
         Vector3 targetLocalPosition,
         out float distance,
-        out bool crossRegion)
+        out bool crossRegion,
+        bool? seamLockPushEastWest = null,
+        int seamLockDirection = 0)
     {
         crossRegion = botSim.Handle != targetRegionHandle;
         if (!crossRegion)
@@ -1515,7 +1576,44 @@ internal sealed partial class BotSession
             botPosition.Y + delta.Y,
             botPosition.Z + Math.Clamp(delta.Z, -3f, 3f));
 
-        return ClampEdgeWaypoint(projectedLocal);
+        return BuildCrossRegionSeamWaypoint(projectedLocal, delta, seamLockPushEastWest, seamLockDirection);
+    }
+
+    private static Vector3 BuildCrossRegionSeamWaypoint(
+        Vector3 projectedLocal,
+        Vector3 delta,
+        bool? seamLockPushEastWest = null,
+        int seamLockDirection = 0)
+    {
+        var waypoint = ClampEdgeWaypoint(projectedLocal);
+        var adjustedX = waypoint.X;
+        var adjustedY = waypoint.Y;
+        var pushEastWest = seamLockPushEastWest ?? (MathF.Abs(delta.X) >= MathF.Abs(delta.Y));
+        var lockDirection = seamLockDirection == 0 ? 0 : Math.Sign(seamLockDirection);
+
+        if (pushEastWest)
+        {
+            var eastWestDirection = lockDirection != 0
+                ? lockDirection
+                : (delta.X >= 0f ? 1 : -1);
+            adjustedX = eastWestDirection >= 0
+                ? 256f + CrossRegionSeamOvershootMeters
+                : -CrossRegionSeamOvershootMeters;
+        }
+        else
+        {
+            var northSouthDirection = lockDirection != 0
+                ? lockDirection
+                : (delta.Y >= 0f ? 1 : -1);
+            adjustedY = northSouthDirection >= 0
+                ? 256f + CrossRegionSeamOvershootMeters
+                : -CrossRegionSeamOvershootMeters;
+        }
+
+        adjustedX = Math.Clamp(adjustedX, CrossRegionWaypointMinLocal, CrossRegionWaypointMaxLocal);
+        adjustedY = Math.Clamp(adjustedY, CrossRegionWaypointMinLocal, CrossRegionWaypointMaxLocal);
+        var adjustedZ = Math.Clamp(projectedLocal.Z, 0f, 4096f);
+        return new Vector3(adjustedX, adjustedY, adjustedZ);
     }
 
     private async Task<(bool Confirmed, string Details)> VerifyCrossRegionTeleportAsync(
@@ -1587,8 +1685,25 @@ internal sealed partial class BotSession
         client.Self.AutoPilot((ulong)regionX + localX, (ulong)regionY + localY, localPosition.Z);
     }
 
-    private static bool ApplyFollowDirectionalControls(GridClient client, Vector3 targetPos, FollowMode locomotionMode)
+    private void ClearDirectionalFollowCache()
     {
+        _lastDirectionalTurnTarget = null;
+        _lastDirectionalAtPos = null;
+        _lastDirectionalUpPos = null;
+        _lastDirectionalUpNeg = null;
+        _lastDirectionalFastUp = null;
+        _lastDirectionalUpdateAt = DateTime.MinValue;
+    }
+
+    private bool ApplyFollowDirectionalControls(
+        GridClient client,
+        Vector3 targetPos,
+        FollowMode locomotionMode,
+        out Vector3 turnTargetUsed,
+        ulong? targetRegionHandle = null,
+        Vector3? targetRegionLocal = null)
+    {
+        turnTargetUsed = ClampEdgeWaypoint(targetPos);
         var movement = client.Self.Movement;
         if (!client.Settings.Agent.SendUpdates)
         {
@@ -1598,10 +1713,41 @@ internal sealed partial class BotSession
         var delta = targetPos - client.Self.SimPosition;
         var distance2D = MathF.Sqrt((delta.X * delta.X) + (delta.Y * delta.Y));
 
-        // Face the target before driving AtPos so forward movement stays aligned.
-        movement.TurnToward(targetPos, sendUpdate: false);
+        // For cross-region movement, derive facing from world-space direction and then
+        // project back into a valid local target to avoid heading inversions near seams.
+        var currentSim = client.Network.CurrentSim;
+        if (targetRegionHandle.HasValue
+            && targetRegionLocal.HasValue
+            && currentSim != null
+            && currentSim.Handle != targetRegionHandle.Value)
+        {
+            var botGlobal = ToGlobalPosition(currentSim.Handle, client.Self.SimPosition);
+            var targetGlobal = ToGlobalPosition(targetRegionHandle.Value, targetRegionLocal.Value);
+            var worldDelta = targetGlobal - botGlobal;
+            var planarWorldDelta = new Vector3(worldDelta.X, worldDelta.Y, 0f);
 
-        movement.AtPos = distance2D > 0.35f;
+            if (planarWorldDelta.LengthSquared() > 0.0001f)
+            {
+                var headingDir = Vector3.Normalize(planarWorldDelta);
+                var projectedTurnTarget = client.Self.SimPosition + (headingDir * 8.0f);
+                turnTargetUsed = ClampEdgeWaypoint(projectedTurnTarget);
+            }
+        }
+
+        var shouldMoveForward = distance2D > 0.35f;
+
+        // Avoid visible reorientation churn while briefly paused inside follow tolerance.
+        if (shouldMoveForward)
+        {
+            if (!_lastDirectionalTurnTarget.HasValue
+                || Vector3.Distance(_lastDirectionalTurnTarget.Value, turnTargetUsed) >= DirectionalTurnRetargetDistanceMeters)
+            {
+                movement.TurnToward(turnTargetUsed, sendUpdate: false);
+                _lastDirectionalTurnTarget = turnTargetUsed;
+            }
+        }
+
+        movement.AtPos = shouldMoveForward;
         movement.AtNeg = false;
         movement.LeftPos = false;
         movement.LeftNeg = false;
@@ -1621,7 +1767,27 @@ internal sealed partial class BotSession
             movement.FastUp = false;
         }
 
-        movement.SendUpdate(true);
+        var directionalStateChanged =
+            _lastDirectionalAtPos != movement.AtPos
+            || _lastDirectionalUpPos != movement.UpPos
+            || _lastDirectionalUpNeg != movement.UpNeg
+            || _lastDirectionalFastUp != movement.FastUp;
+
+        var now = DateTime.UtcNow;
+        var keepaliveDue = shouldMoveForward
+            && (_lastDirectionalUpdateAt == DateTime.MinValue
+                || (now - _lastDirectionalUpdateAt) >= DirectionalUpdateKeepaliveInterval);
+
+        if (directionalStateChanged || keepaliveDue)
+        {
+            movement.SendUpdate(true);
+            _lastDirectionalUpdateAt = now;
+            _lastDirectionalAtPos = movement.AtPos;
+            _lastDirectionalUpPos = movement.UpPos;
+            _lastDirectionalUpNeg = movement.UpNeg;
+            _lastDirectionalFastUp = movement.FastUp;
+        }
+
         return true;
     }
 
@@ -1806,7 +1972,7 @@ internal sealed partial class BotSession
     }
 
     private static bool TryResolveObject(Simulator sim, string target, out uint localId, out string label)
-    {
+{
         localId = 0;
         label = string.Empty;
         var trimmed = target.Trim();
@@ -2141,6 +2307,51 @@ internal sealed partial class BotSession
 
         return false;
     }
+        
+    // Stage 1: Apply locomotion mode deltas only when required.
+    // This keeps network updates lower and avoids control-flag churn.
+
+    private void ApplyFollowLocomotionMode(GridClient client, FollowMode locomotionModeDesired)
+    {
+        var controlMode = ResolveLocomotionControlMode(locomotionModeDesired);
+        if (lastAppliedLocomotionMode == controlMode)
+        {
+            return;
+        }
+
+        switch (controlMode)
+        {
+            case FollowMode.Flying:
+                client.Self.Fly(true);
+                client.Self.Movement.FastAt = false;
+                client.Self.Movement.FastLeft = false;
+                client.Self.Movement.AlwaysRun = false;
+                client.Self.Movement.SendUpdate(true);
+                break;
+            case FollowMode.Running:
+                client.Self.Fly(false);
+                client.Self.Movement.FastAt = true;
+                client.Self.Movement.FastLeft = true;
+                client.Self.Movement.AlwaysRun = true;
+                client.Self.Movement.SendUpdate(true);
+                break;
+            default:
+                client.Self.Fly(false);
+                client.Self.Movement.FastAt = false;
+                client.Self.Movement.FastLeft = false;
+                client.Self.Movement.AlwaysRun = false;
+                client.Self.Movement.SendUpdate(true);
+                break;
+        }
+
+        if (IsFollowDiagnosticsEnabled())
+        {
+            Console.WriteLine(
+                $"[follow][runmode] controls_applied requestedMode={locomotionModeDesired} appliedLocomotion={controlMode} fastAt={client.Self.Movement.FastAt} fastLeft={client.Self.Movement.FastLeft} flyNow={client.Self.Movement.Fly} alwaysRunNow={client.Self.Movement.AlwaysRun}");
+        }
+
+        lastAppliedLocomotionMode = controlMode;
+    }
 
     private static bool IsDoorLikePrim(Primitive prim)
     {
@@ -2264,28 +2475,47 @@ internal sealed partial class BotSession
             from.Y + ((to.Y - from.Y) * ratio),
             from.Z + ((to.Z - from.Z) * ratio));
     }
-}
+    
+    
+    static FollowMode ResolveLocomotionControlMode(FollowMode mode)
+        => mode switch
+        {
+            FollowMode.Running or FollowMode.RunningToBorder => FollowMode.Running,
+            FollowMode.Flying or FollowMode.FlyingToBorder => FollowMode.Flying,
+            _ => FollowMode.Walking
+        };
 
-internal sealed record CameraState(
-    float CameraX,
-    float CameraY,
-    float CameraZ,
-    float AtAxisX,
-    float AtAxisY,
-    float AtAxisZ,
-    float LeftAxisX,
-    float LeftAxisY,
-    float LeftAxisZ,
-    float UpAxisX,
-    float UpAxisY,
-    float UpAxisZ,
-    float Far,
-    float AgentX,
-    float AgentY,
-    float AgentZ);
+    static bool IsCrossRegionPhase(FollowMode mode)
+        => mode is FollowMode.WalkingToBorder
+            or FollowMode.RunningToBorder
+            or FollowMode.FlyingToBorder
+            or FollowMode.TeleportingToTarget
+            or FollowMode.AwaitingTeleportAssist;
 
+    static bool IsBorderWalkPhase(FollowMode mode)
+        => mode is FollowMode.WalkingToBorder
+            or FollowMode.RunningToBorder
+            or FollowMode.FlyingToBorder;
 
-internal sealed record CameraStateResult(bool Ok, string Message, CameraState? State)
-{
-    public static CameraStateResult FailResult(string message) => new(false, message, null);
+    static bool IsWalkPhase(FollowMode mode)
+        => mode is FollowMode.WalkingToBorder
+            or FollowMode.Walking;
+
+    static bool IsViewerCrossingInProgress(AgentManager.CrossingState state)
+        => state is AgentManager.CrossingState.PreparingCross
+            or AgentManager.CrossingState.Connecting
+            or AgentManager.CrossingState.WaitingForComplete
+            or AgentManager.CrossingState.Recovering;
+
+    static FollowMode ResolveBorderFollowMode(FollowMode currentMode, FollowMode fallbackMode)
+        => ResolveLocomotionControlMode(currentMode) switch
+        {
+            FollowMode.Running => FollowMode.RunningToBorder,
+            FollowMode.Flying => FollowMode.FlyingToBorder,
+            _ => ResolveLocomotionControlMode(fallbackMode) switch
+            {
+                FollowMode.Flying => FollowMode.FlyingToBorder,
+                _ => FollowMode.RunningToBorder
+            }
+        };
 }

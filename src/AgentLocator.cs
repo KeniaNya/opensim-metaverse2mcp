@@ -150,12 +150,32 @@ internal sealed class AgentLocator
                     {
                         AgentMonitorStatus? previous = initialStatus;
                         var lastStatus = initialStatus;
+                        var monitorPausedForCrossing = false;
         
                         _latestStatusByHandle[taskHandle.Handle] = ToSnapshot(targetId, initialStatus);
                         while (!taskCancellationToken.IsCancellationRequested)
                         {
                             try
                             {
+                                var crossingState = connectedClient.Self.GetCrossingState();
+                                if (IsViewerCrossingInProgress(crossingState))
+                                {
+                                    if (!monitorPausedForCrossing)
+                                    {
+                                        monitorPausedForCrossing = true;
+                                        LogDiag(correlationId, $"monitor paused for crossing target={targetId} state={crossingState} sim={(connectedClient.Network.CurrentSim?.Name ?? "(none)")}");
+                                    }
+
+                                    await Task.Delay(TimeSpan.FromMilliseconds(500), taskCancellationToken).ConfigureAwait(false);
+                                    continue;
+                                }
+
+                                if (monitorPausedForCrossing)
+                                {
+                                    monitorPausedForCrossing = false;
+                                    LogDiag(correlationId, $"monitor resumed after crossing target={targetId} state={crossingState} sim={(connectedClient.Network.CurrentSim?.Name ?? "(none)")}");
+                                }
+
                                 var current = await CaptureStatusAsync(targetId, connectedClient, previous, taskCancellationToken, correlationId).ConfigureAwait(false);
                                 current = current with
                                 {
@@ -1218,6 +1238,12 @@ internal sealed class AgentLocator
         Utils.LongToUInts(regionHandle, out var regionX, out var regionY);
         return new Vector3(regionX + localPosition.X, regionY + localPosition.Y, localPosition.Z);
     }
+
+    private static bool IsViewerCrossingInProgress(AgentManager.CrossingState state)
+        => state is AgentManager.CrossingState.PreparingCross
+            or AgentManager.CrossingState.Connecting
+            or AgentManager.CrossingState.WaitingForComplete
+            or AgentManager.CrossingState.Recovering;
 
     private static string FormatVector(Vector3 value)
         => $"<{value.X:0.###}, {value.Y:0.###}, {value.Z:0.###}>";

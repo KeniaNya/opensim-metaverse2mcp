@@ -304,7 +304,7 @@ internal sealed partial class BotSession : IDisposable
             : BotToolResult.Fail("Task handle was not found among active tasks.");
     }
 
-        public async Task<bool> ConnectAsync(CancellationToken cancellationToken)
+    public async Task<bool> ConnectAsync(CancellationToken cancellationToken)
     {
         await _connectGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -422,7 +422,9 @@ internal sealed partial class BotSession : IDisposable
             TryLoadOpencodeSessionStateFromFile();
 
             await TryLoadInventoryOfferPoliciesFromConfiguredFileAsync(cancellationToken).ConfigureAwait(false);
-            StartControlGroupBootstrap(client);
+            
+            // TODO Might be interferering with crossing regions - and ... do we REALLY need to do this?
+           // StartControlGroupBootstrap(client);
             return true;
         }
         finally
