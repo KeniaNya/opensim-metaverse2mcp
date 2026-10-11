@@ -116,6 +116,9 @@ The server publishes tools including:
 - `EventStreamStats`
 - `InventoryOfferPolicyRulesSave`
 - `InventoryOfferPolicyRulesLoad`
+- `ObjectMonitorSimOrPrim`
+- `ListObjectMonitors`
+- `CloseObjectMonitor`
 - `AppearanceListWorn`
 - `AppearanceGetCurrentOutfit`
 - `AppearanceWearFolder`
@@ -331,6 +334,7 @@ Inventory and asset notes:
 
 Event stream notes:
 - Hybrid default: use `EventStreamSubscribe` once, then `EventStreamPoll` with a cursor and non-zero `waitMs` for reactive long-poll behavior.
+- Object update events are monitor-gated by default: call `ObjectMonitorSimOrPrim` to enable emission, inspect active monitors with `ListObjectMonitors`, and remove with `CloseObjectMonitor`.
 - Channels are split as `general`, `object`, `teleport`, `progress`, `follow`, `agentMonitor`, and `friends` (`all` is accepted as shorthand).
 - Event filtering supports `eventTypes`, `radiusMeters`, `objectIds`, `objectLocalIds`, and `chatSources` on subscribe and poll.
 - Buffers are bounded per channel; when full, oldest events are trimmed.

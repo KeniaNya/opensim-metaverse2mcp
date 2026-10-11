@@ -2876,7 +2876,7 @@ internal sealed class BotMcpTools
         return _bot.InventoryOfferHistoryList(maxResults);
     }
 
-    [McpServerTool, Description("Create an MCP runtime event subscription for filtered channels/types.")]
+    [McpServerTool, Description("Create an MCP runtime event subscription for filtered channels/types. Object channel updates are monitor-gated and require ObjectMonitorSimOrPrim.")]
     public EventStreamSubscriptionResult EventStreamSubscribe(
         [Description("Optional channels list: general, object, teleport, progress, follow, agentMonitor, all. Delimit with comma/space/pipe.")] string? channels = null,
         [Description("Optional event-type filter list. Delimit with comma/space/pipe.")] string? eventTypes = null,
@@ -2888,6 +2888,30 @@ internal sealed class BotMcpTools
         return _bot.EventStreamSubscribe(channels, eventTypes, radiusMeters, objectIds, objectLocalIds, chatSources);
     }
 
+    [McpServerTool, Description("Add an object-update monitor spec. Object/terse updates are emitted only when at least one monitor matches region+prim criteria.")]
+    public ObjectMonitorResult ObjectMonitorSimOrPrim(
+        [Description("Region handle to monitor (0 = all regions).") ] ulong regionHandle = 0,
+        [Description("Prim local ID to monitor (0 = all prims).") ] uint primId = 0,
+        [Description("When true and primId is set, child prim updates for that prim also match.") ] bool children = false,
+        [Description("When true, matching terse object updates emit events.") ] bool terseUpdateEvent = true,
+        [Description("When true, matching full object updates emit events.") ] bool fullUpdateEvent = true)
+    {
+        return _bot.ObjectMonitorSimOrPrim(regionHandle, primId, children, terseUpdateEvent, fullUpdateEvent);
+    }
+
+    [McpServerTool, Description("List active object monitors and their filter specs.")]
+    public ObjectMonitorListResult ListObjectMonitors()
+    {
+        return _bot.ListObjectMonitors();
+    }
+
+    [McpServerTool, Description("Close one object monitor by handle. Pass empty/null to close all object monitors.")]
+    public BotToolResult CloseObjectMonitor(
+        [Description("Object monitor handle returned by ObjectMonitorSimOrPrim. Empty/null closes all monitors.") ] string? monitorHandle = null)
+    {
+        return _bot.CloseObjectMonitor(monitorHandle);
+    }
+
     [McpServerTool, Description("Remove an existing MCP runtime event subscription.")]
     public BotToolResult EventStreamUnsubscribe(
         [Description("Subscription ID returned by EventStreamSubscribe.")] string subscriptionId)
@@ -2895,7 +2919,7 @@ internal sealed class BotMcpTools
         return _bot.EventStreamUnsubscribe(subscriptionId);
     }
 
-    [McpServerTool, Description("Poll MCP runtime events with cursoring; supports long-poll wait for reactive workflows.")]
+    [McpServerTool, Description("Poll MCP runtime events with cursoring; supports long-poll wait for reactive workflows. Object channel updates remain monitor-gated.")]
     public Task<EventStreamPollResult> EventStreamPoll(
         [Description("Maximum events to return (1..500).") ] int maxResults,
         [Description("Long-poll wait timeout in milliseconds (0..30000).") ] int waitMs,
@@ -2923,7 +2947,7 @@ internal sealed class BotMcpTools
             cancellationToken);
     }
 
-    [McpServerTool, Description("Query a short historical window of retained runtime events for debugging.")]
+    [McpServerTool, Description("Query a short historical window of retained runtime events for debugging. Object channel history contains only monitor-gated events.")]
     public EventStreamHistoryResult EventStreamHistory(
         [Description("Window size in seconds (1..1800).") ] int lastSeconds,
         [Description("Optional channels list: general, object, teleport, progress, follow, agentMonitor, all.")] string? channels = null,

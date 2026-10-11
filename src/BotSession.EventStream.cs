@@ -26,6 +26,7 @@ internal sealed partial class BotSession
     private readonly SemaphoreSlim _eventStreamSignal = new(0, int.MaxValue);
     private readonly ConcurrentDictionary<string, EventStreamSubscriptionState> _eventSubscriptions = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTimeOffset> _objectEventThrottle = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, ObjectMonitorSpec> _objectMonitors = new(StringComparer.OrdinalIgnoreCase);
     private long _eventStreamSequence;
     private int _eventStreamTrimmedTotal;
     private int _eventStreamTrimmedGeneral;
@@ -76,7 +77,73 @@ internal sealed partial class BotSession
             filter.ObjectIds?.OrderBy(v => v, StringComparer.OrdinalIgnoreCase).ToArray(),
             filter.ObjectLocalIds?.OrderBy(v => v, StringComparer.OrdinalIgnoreCase).ToArray(),
             filter.ChatSources?.OrderBy(v => v, StringComparer.OrdinalIgnoreCase).ToArray(),
-            "Subscription created.");
+            BuildEventSubscriptionMessage(channelSet));
+    }
+
+    public ObjectMonitorResult ObjectMonitorSimOrPrim(
+        ulong regionHandle,
+        uint primId,
+        bool children,
+        bool terseUpdateEvent,
+        bool fullUpdateEvent)
+    {
+        if (!terseUpdateEvent && !fullUpdateEvent)
+        {
+            return ObjectMonitorResult.FailResult("At least one of terseUpdateEvent or fullUpdateEvent must be true.");
+        }
+
+        var handle = Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
+        var spec = new ObjectMonitorSpec(
+            handle,
+            regionHandle,
+            primId,
+            children,
+            terseUpdateEvent,
+            fullUpdateEvent,
+            DateTimeOffset.UtcNow);
+
+        _objectMonitors[handle] = spec;
+
+        return ObjectMonitorResult.OkResult(
+            handle,
+            spec.RegionHandle,
+            spec.PrimId,
+            spec.Children,
+            spec.TerseUpdateEvent,
+            spec.FullUpdateEvent,
+            $"Object monitor '{handle}' added. Active monitors: {_objectMonitors.Count}.");
+    }
+
+    public BotToolResult CloseObjectMonitor(string? monitorHandle)
+    {
+        if (string.IsNullOrWhiteSpace(monitorHandle))
+        {
+            var removed = _objectMonitors.Count;
+            _objectMonitors.Clear();
+            return BotToolResult.OkResult($"Closed all object monitors ({removed}).");
+        }
+
+        var normalizedHandle = monitorHandle.Trim();
+        return _objectMonitors.TryRemove(normalizedHandle, out _)
+            ? BotToolResult.OkResult($"Closed object monitor '{normalizedHandle}'. Active monitors: {_objectMonitors.Count}.")
+            : BotToolResult.Fail($"Object monitor handle '{normalizedHandle}' was not found.");
+    }
+
+    public ObjectMonitorListResult ListObjectMonitors()
+    {
+        var monitors = _objectMonitors.Values
+            .OrderBy(spec => spec.CreatedAtUtc)
+            .Select(spec => new ObjectMonitorInfo(
+                spec.Handle,
+                spec.RegionHandle,
+                spec.PrimId,
+                spec.Children,
+                spec.TerseUpdateEvent,
+                spec.FullUpdateEvent,
+                spec.CreatedAtUtc.ToString("O", CultureInfo.InvariantCulture)))
+            .ToArray();
+
+        return ObjectMonitorListResult.OkResult(monitors, $"Returned {monitors.Length} object monitor(s).");
     }
 
     public BotToolResult EventStreamUnsubscribe(string subscriptionId)
@@ -434,6 +501,7 @@ internal sealed partial class BotSession
             e.Simulator,
             "object.updated",
             "object.updated",
+            isTerseUpdate: false,
             objectId => $"Object update for {objectId}.");
     }
     
@@ -444,6 +512,7 @@ internal sealed partial class BotSession
             e.Simulator,
             "object.terse.updated",
             "object.terse.updated",
+            isTerseUpdate: true,
             objectId => $"Terse object update for {objectId}.");
     }
 
@@ -452,6 +521,7 @@ internal sealed partial class BotSession
         Simulator? simulator,
         string throttleKey,
         string eventType,
+        bool isTerseUpdate,
         Func<UUID, string> messageFactory)
     {
         if (prim == null)
@@ -460,7 +530,7 @@ internal sealed partial class BotSession
         }
 
         var objectId = prim.ID;
-        if (objectId == UUID.Zero || !TryAcquireObjectEventThrottle(throttleKey))
+        if (objectId == UUID.Zero || !ShouldEmitObjectUpdateEvent(prim, simulator, isTerseUpdate) || !TryAcquireObjectEventThrottle(throttleKey))
         {
             return;
         }
@@ -484,6 +554,96 @@ internal sealed partial class BotSession
                 ["positionWorld"] = FormatVector3(worldPosition),
                 ["positionLocal"] = FormatVector3(localPosition)
             });
+    }
+
+    private string BuildEventSubscriptionMessage(HashSet<string> channels)
+    {
+        if (!channels.Contains("object"))
+        {
+            return "Subscription created.";
+        }
+
+        return _objectMonitors.Count == 0
+            ? "Subscription created. Note: object events are disabled by default; use ObjectMonitorSimOrPrim to enable monitored object updates."
+            : $"Subscription created. Object monitor gating is active with {_objectMonitors.Count} monitor(s).";
+    }
+
+    private bool ShouldEmitObjectUpdateEvent(Primitive prim, Simulator? simulator, bool isTerseUpdate)
+    {
+        if (_objectMonitors.IsEmpty)
+        {
+            return false;
+        }
+
+        var regionHandle = simulator?.Handle ?? prim.RegionHandle;
+        foreach (var spec in _objectMonitors.Values)
+        {
+            if (spec.RegionHandle != 0 && spec.RegionHandle != regionHandle)
+            {
+                continue;
+            }
+
+            if (isTerseUpdate ? !spec.TerseUpdateEvent : !spec.FullUpdateEvent)
+            {
+                continue;
+            }
+
+            if (!IsObjectMonitorPrimMatch(spec, prim, simulator))
+            {
+                continue;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsObjectMonitorPrimMatch(ObjectMonitorSpec spec, Primitive prim, Simulator? simulator)
+    {
+        if (spec.PrimId == 0)
+        {
+            return true;
+        }
+
+        if (prim.LocalID == spec.PrimId)
+        {
+            return true;
+        }
+
+        if (!spec.Children || prim.ParentID == 0)
+        {
+            return false;
+        }
+
+        var ancestorLocalId = prim.ParentID;
+        if (ancestorLocalId == spec.PrimId)
+        {
+            return true;
+        }
+
+        if (simulator == null)
+        {
+            return false;
+        }
+
+        var visited = new HashSet<uint>();
+        var depth = 0;
+        while (ancestorLocalId != 0
+               && depth < 16
+               && visited.Add(ancestorLocalId)
+               && simulator.ObjectsPrimitives.TryGetValue(ancestorLocalId, out var ancestor))
+        {
+            if (ancestor.LocalID == spec.PrimId)
+            {
+                return true;
+            }
+
+            ancestorLocalId = ancestor.ParentID;
+            depth++;
+        }
+
+        return false;
     }
 
     private bool TryAcquireObjectEventThrottle(string throttleKey)
@@ -1022,6 +1182,15 @@ internal sealed partial class BotSession
         long Cursor,
         DateTimeOffset CreatedAtUtc,
         DateTimeOffset LastAccessAtUtc);
+
+    private sealed record ObjectMonitorSpec(
+        string Handle,
+        ulong RegionHandle,
+        uint PrimId,
+        bool Children,
+        bool TerseUpdateEvent,
+        bool FullUpdateEvent,
+        DateTimeOffset CreatedAtUtc);
 }
 
 internal sealed record EventStreamFilterSpec(
@@ -1167,4 +1336,52 @@ internal sealed record EventStreamHistoryResult(
 
     public static EventStreamHistoryResult FailResult(string message)
         => new(false, message, "0", 0, 0, 0, 0, 0, Array.Empty<RuntimeEventInfo>());
+}
+
+internal sealed record ObjectMonitorResult(
+    bool Ok,
+    string Message,
+    string? MonitorHandle,
+    ulong RegionHandle,
+    uint PrimId,
+    bool Children,
+    bool TerseUpdateEvent,
+    bool FullUpdateEvent)
+{
+    public static ObjectMonitorResult OkResult(
+        string monitorHandle,
+        ulong regionHandle,
+        uint primId,
+        bool children,
+        bool terseUpdateEvent,
+        bool fullUpdateEvent,
+        string message)
+        => new(true, message, monitorHandle, regionHandle, primId, children, terseUpdateEvent, fullUpdateEvent);
+
+    public static ObjectMonitorResult FailResult(string message)
+        => new(false, message, null, 0UL, 0U, false, false, false);
+}
+
+internal sealed record ObjectMonitorInfo(
+    string MonitorHandle,
+    ulong RegionHandle,
+    uint PrimId,
+    bool Children,
+    bool TerseUpdateEvent,
+    bool FullUpdateEvent,
+    string CreatedAtUtc);
+
+internal sealed record ObjectMonitorListResult(
+    bool Ok,
+    string Message,
+    int Count,
+    IReadOnlyList<ObjectMonitorInfo> Monitors)
+{
+    public static ObjectMonitorListResult OkResult(
+        IReadOnlyList<ObjectMonitorInfo> monitors,
+        string message)
+        => new(true, message, monitors.Count, monitors);
+
+    public static ObjectMonitorListResult FailResult(string message)
+        => new(false, message, 0, Array.Empty<ObjectMonitorInfo>());
 }
