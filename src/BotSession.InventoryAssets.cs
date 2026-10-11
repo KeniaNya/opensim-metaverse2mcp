@@ -2658,6 +2658,145 @@ internal sealed partial class BotSession
             : BotToolResult.Fail($"No materialized inventory list results were found for handle '{handle}'."));
     }
 
+    public async Task<DataToolResult> LandmarkListAsync(string? nameContains, int maxResults, CancellationToken cancellationToken)
+    {
+        var effectiveMax = Math.Clamp(maxResults <= 0 ? 200 : maxResults, 1, 2000);
+        var normalizedName = string.IsNullOrWhiteSpace(nameContains) ? null : nameContains.Trim();
+
+        return await ExecuteLockedAsync(async (client, token) =>
+        {
+            var store = client.Inventory.Store;
+            if (store?.RootFolder == null)
+            {
+                return DataToolResult.FailResult("Inventory store is not initialized.");
+            }
+
+            if (!TryResolveLandmarkFolderUuid(client, store, out var landmarksFolderId, out var folderError))
+            {
+                return DataToolResult.FailResult(folderError ?? "Could not locate landmarks folder.");
+            }
+
+            var folders = new List<InventoryFolder>();
+            var items = new List<InventoryItem>();
+            await client.Inventory.GetInventoryRecursiveAsync(landmarksFolderId, client.Self.AgentID, folders, items, token).ConfigureAwait(false);
+
+            var entries = items
+                .Select(item => ResolveLinkedInventoryItem(store, item))
+                .Where(IsLandmarkInventoryItem)
+                .GroupBy(item => item.UUID)
+                .Select(group => group.First())
+                .Where(item => normalizedName == null || item.Name.Contains(normalizedName, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
+                .Take(effectiveMax)
+                .Select(item => new LandmarkInfo(
+                    item.UUID.ToString(),
+                    item.AssetUUID.ToString(),
+                    item.ParentUUID.ToString(),
+                    item.Name,
+                    item.Description,
+                    item.CreationDate == default ? null : item.CreationDate.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture)))
+                .ToArray();
+
+            return DataToolResult.OkResult(
+                $"Returned {entries.Length} landmark inventory item(s).",
+                JsonSerializer.Serialize(entries));
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<BotToolResult> LandmarkCreateAsync(
+        string name,
+        string? description,
+        string? folderIdOrPath,
+        float? x,
+        float? y,
+        float? z,
+        bool useCurrentPosition,
+        CancellationToken cancellationToken)
+    {
+        var normalizedName = (name ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalizedName))
+        {
+            return BotToolResult.Fail("name is required.");
+        }
+
+        return await ExecuteLockedAsync(async (client, token) =>
+        {
+            var currentSim = client.Network.CurrentSim;
+            if (currentSim == null)
+            {
+                return BotToolResult.Fail("No current simulator available.");
+            }
+
+            if (currentSim.ID == UUID.Zero)
+            {
+                return BotToolResult.Fail("Current simulator region UUID is unavailable; cannot create landmark asset.");
+            }
+
+            Vector3 target;
+            if (useCurrentPosition)
+            {
+                target = client.Self.SimPosition;
+            }
+            else
+            {
+                if (!x.HasValue || !y.HasValue || !z.HasValue)
+                {
+                    return BotToolResult.Fail("x, y, and z are required when useCurrentPosition is false.");
+                }
+
+                target = new Vector3(x.Value, y.Value, z.Value);
+            }
+
+            target = ClampLocalPosition(target, currentSim.SizeX, currentSim.SizeY);
+
+            var store = client.Inventory.Store;
+            if (store?.RootFolder == null)
+            {
+                return BotToolResult.Fail("Inventory store is not initialized.");
+            }
+
+            UUID folderUuid;
+            if (!string.IsNullOrWhiteSpace(folderIdOrPath))
+            {
+                if (!TryResolveInventoryFolderUuid(client, store, folderIdOrPath, allowEmptyForRoot: false, parameterName: "folderIdOrPath", out folderUuid, out var resolveError))
+                {
+                    return BotToolResult.Fail(resolveError);
+                }
+            }
+            else if (!TryResolveLandmarkFolderUuid(client, store, out folderUuid, out var folderError))
+            {
+                return BotToolResult.Fail(folderError ?? "Could not locate landmarks folder.");
+            }
+
+            var landmarkAsset = new AssetLandmark
+            {
+                RegionID = currentSim.ID,
+                Position = target
+            };
+            landmarkAsset.Encode();
+
+            var create = await client.Inventory
+                .RequestCreateItemFromAssetAsync(
+                    landmarkAsset.AssetData,
+                    normalizedName,
+                    description ?? string.Empty,
+                    AssetType.Landmark,
+                    InventoryType.Landmark,
+                    folderUuid,
+                    Permissions.NoPermissions,
+                    token)
+                .ConfigureAwait(false);
+
+            if (!create.success)
+            {
+                return BotToolResult.Fail($"Landmark create failed: {create.status}");
+            }
+
+            return BotToolResult.OkResult(
+                $"Created landmark '{normalizedName}' item={create.itemID} asset={create.assetID} at {currentSim.Name} <{target.X:0.###}, {target.Y:0.###}, {target.Z:0.###}>.");
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
     private async Task<InventoryQueryResult> FetchInventoryListAsync(
         string? folderIdOrPath,
         bool recursive,
@@ -5207,6 +5346,153 @@ internal sealed partial class BotSession
         return false;
     }
 
+    private static bool TryResolveLandmarkFolderUuid(
+        GridClient client,
+        Inventory store,
+        out UUID folderUuid,
+        out string? error)
+    {
+        folderUuid = client.Inventory.FindFolderForType(FolderType.Landmark);
+        if (folderUuid != UUID.Zero && TryGetInventoryFolderFromStore(store, folderUuid, out _))
+        {
+            error = null;
+            return true;
+        }
+
+        var root = store.RootFolder;
+        if (root == null)
+        {
+            error = "Inventory root folder is not initialized.";
+            return false;
+        }
+
+        List<InventoryBase> rootContents;
+        try
+        {
+            rootContents = store.GetContents(root.UUID);
+        }
+        catch (Exception ex)
+        {
+            error = $"Failed reading inventory root folder from local store: {ex.Message}";
+            return false;
+        }
+
+        var candidates = rootContents
+            .OfType<InventoryFolder>()
+            .Where(folder => folder.PreferredType == FolderType.Landmark
+                || string.Equals(folder.Name?.Trim(), "Landmarks", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (candidates.Count == 0)
+        {
+            error = "Could not locate Landmarks folder in local inventory store.";
+            return false;
+        }
+
+        if (candidates.Count > 1)
+        {
+            error = $"Landmarks folder is ambiguous ({candidates.Count} matches).";
+            return false;
+        }
+
+        folderUuid = candidates[0].UUID;
+        error = null;
+        return true;
+    }
+
+    private static bool IsLandmarkInventoryItem(InventoryItem item)
+        => item.AssetType == AssetType.Landmark || item.InventoryType == InventoryType.Landmark;
+
+    private static async Task<(bool Ok, UUID AssetId, string DisplayName, string? ErrorMessage)> ResolveLandmarkReferenceAsync(
+        GridClient client,
+        string landmarkIdOrName,
+        CancellationToken cancellationToken)
+    {
+        var raw = (landmarkIdOrName ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return (false, UUID.Zero, string.Empty, "landmarkIdOrName is required.");
+        }
+
+        if (UUID.TryParse(raw, out var parsedUuid))
+        {
+            var item = await ResolveInventoryItemAsync(client, parsedUuid, cancellationToken).ConfigureAwait(false);
+            if (item != null)
+            {
+                var resolved = ResolveLinkedInventoryItem(client.Inventory.Store, item);
+                if (!IsLandmarkInventoryItem(resolved))
+                {
+                    return (false, UUID.Zero, string.Empty, $"Inventory item {parsedUuid} is not a landmark item.");
+                }
+
+                if (resolved.AssetUUID == UUID.Zero)
+                {
+                    return (false, UUID.Zero, string.Empty, $"Landmark item {parsedUuid} has no asset UUID.");
+                }
+
+                return (true, resolved.AssetUUID, $"{resolved.Name} ({resolved.UUID})", null);
+            }
+
+            // If the UUID does not resolve to an inventory item, treat it as a raw landmark asset UUID.
+            return (true, parsedUuid, parsedUuid.ToString(), null);
+        }
+
+        var store = client.Inventory.Store;
+        if (store?.RootFolder == null)
+        {
+            return (false, UUID.Zero, string.Empty, "Inventory store is not initialized.");
+        }
+
+        if (!TryResolveLandmarkFolderUuid(client, store, out var landmarksFolderId, out var folderError))
+        {
+            return (false, UUID.Zero, string.Empty, folderError ?? "Could not locate landmarks folder.");
+        }
+
+        var folders = new List<InventoryFolder>();
+        var items = new List<InventoryItem>();
+        await client.Inventory.GetInventoryRecursiveAsync(landmarksFolderId, client.Self.AgentID, folders, items, cancellationToken).ConfigureAwait(false);
+
+        var landmarks = items
+            .Select(item => ResolveLinkedInventoryItem(store, item))
+            .Where(IsLandmarkInventoryItem)
+            .DistinctBy(item => item.UUID)
+            .ToList();
+
+        var exact = landmarks
+            .Where(item => string.Equals(item.Name?.Trim(), raw, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (exact.Count == 1)
+        {
+            var match = exact[0];
+            return match.AssetUUID == UUID.Zero
+                ? (false, UUID.Zero, string.Empty, $"Landmark '{raw}' has no asset UUID.")
+                : (true, match.AssetUUID, $"{match.Name} ({match.UUID})", null);
+        }
+
+        if (exact.Count > 1)
+        {
+            return (false, UUID.Zero, string.Empty, $"Landmark name '{raw}' is ambiguous ({exact.Count} matches). Use item UUID or asset UUID.");
+        }
+
+        var contains = landmarks
+            .Where(item => item.Name.Contains(raw, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (contains.Count == 1)
+        {
+            var match = contains[0];
+            return match.AssetUUID == UUID.Zero
+                ? (false, UUID.Zero, string.Empty, $"Landmark '{match.Name}' has no asset UUID.")
+                : (true, match.AssetUUID, $"{match.Name} ({match.UUID})", null);
+        }
+
+        if (contains.Count > 1)
+        {
+            return (false, UUID.Zero, string.Empty, $"Landmark name '{raw}' matched multiple entries ({contains.Count}). Use item UUID or asset UUID.");
+        }
+
+        return (false, UUID.Zero, string.Empty, $"Landmark '{raw}' was not found.");
+    }
+
     private static bool IsFolderDescendant(Inventory store, UUID ancestorFolderId, UUID possibleDescendantFolderId)
     {
         var visited = new HashSet<UUID>();
@@ -6186,6 +6472,14 @@ internal sealed record InventoryEntry(
     string AssetType,
     string InventoryType,
     string? CreatorId,
+    string? CreatedUtc);
+
+internal sealed record LandmarkInfo(
+    string ItemId,
+    string AssetId,
+    string ParentId,
+    string Name,
+    string Description,
     string? CreatedUtc);
 
 internal sealed record InventoryQueryResult(

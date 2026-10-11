@@ -39,6 +39,7 @@ The server publishes tools including:
 - `TeleportTo`
 - `TeleportToLandingPoint`
 - `TeleportToRegionHandle`
+- `TeleportToLandmark`
 - `RegionUuid`
 - `Map`
 - `StopMovement`
@@ -97,6 +98,8 @@ The server publishes tools including:
 - `InventoryList`
 - `InventoryListRetrieve`
 - `InventoryListClear`
+- `LandmarkList`
+- `LandmarkCreate`
 - `InventoryGiveItem`
 - `InventoryGiveFolder`
 - `TaskInventoryList`
@@ -332,6 +335,11 @@ Inventory and asset notes:
 - `TaskInventoryTake` requests transfer from object (task) inventory into avatar inventory; server permissions determine copy-vs-move behavior.
 - Cross-avatar "take/copy" is offer-based: you can receive what another avatar offers, but cannot arbitrarily pull from another avatar inventory.
 - `InventoryOfferPolicyRulesSave`/`InventoryOfferPolicyRulesLoad` persist policy rules as JSON; startup auto-load occurs when `INVENTORY_OFFER_POLICY_FILE` exists.
+- `LandmarkCreate` creates landmark assets/items in inventory using either current position or explicit local coordinates in the current region.
+- `LandmarkList` returns landmark names with both inventory item UUID and landmark asset UUID (useful for `TeleportToLandmark`).
+
+Teleport notes:
+- `TeleportToLandmark` accepts landmark inventory item UUID, landmark asset UUID, or landmark name.
 
 Event stream notes:
 - Hybrid default: use `EventStreamSubscribe` once, then `EventStreamPoll` with a cursor and non-zero `waitMs` for reactive long-poll behavior.

@@ -1565,6 +1565,14 @@ internal sealed class BotMcpTools
         return _bot.TeleportToRegionHandleAsync(regionHandle, x, y, z, cancellationToken);
     }
 
+    [McpServerTool, Description("Teleport using a landmark reference (inventory item UUID, landmark asset UUID, or landmark name).")]
+    public Task<BotToolResult> TeleportToLandmark(
+        [Description("Landmark inventory item UUID, landmark asset UUID, or landmark name.")] string landmarkIdOrName,
+        CancellationToken cancellationToken = default)
+    {
+        return _bot.TeleportToLandmarkAsync(landmarkIdOrName, cancellationToken);
+    }
+
     [McpServerTool, Description("Stop current movement by canceling autopilot and resetting movement control flags.")]
     public Task<BotToolResult> StopMovement(CancellationToken cancellationToken)
     {
@@ -2244,6 +2252,29 @@ internal sealed class BotMcpTools
         CancellationToken cancellationToken = default)
     {
         return _bot.InventoryListRetrieveAsync(resultHandle, maxResults, pageSize, nameContains, type, createdAfterUtc, createdBeforeUtc, creatorId, cursor, cancellationToken);
+    }
+
+    [McpServerTool, Description("List landmark inventory entries (name, item UUID, asset UUID), with optional name filtering.")]
+    public Task<DataToolResult> LandmarkList(
+        [Description("Optional case-insensitive substring filter for landmark names.")] string? nameContains = null,
+        [Description("Maximum entries to return (1..2000).") ] int maxResults = 200,
+        CancellationToken cancellationToken = default)
+    {
+        return _bot.LandmarkListAsync(nameContains, maxResults, cancellationToken);
+    }
+
+    [McpServerTool, Description("Create a landmark inventory item for current position or an explicit local position in the current region.")]
+    public Task<BotToolResult> LandmarkCreate(
+        [Description("Landmark item name.")] string name,
+        [Description("Optional landmark description.")] string? description = null,
+        [Description("Optional destination folder UUID/path. Defaults to Landmarks folder.")] string? folderIdOrPath = null,
+        [Description("Set false to use explicit x/y/z in current region.")] bool useCurrentPosition = true,
+        [Description("Local X coordinate when useCurrentPosition=false.")] float? x = null,
+        [Description("Local Y coordinate when useCurrentPosition=false.")] float? y = null,
+        [Description("Local Z coordinate when useCurrentPosition=false.")] float? z = null,
+        CancellationToken cancellationToken = default)
+    {
+        return _bot.LandmarkCreateAsync(name, description, folderIdOrPath, x, y, z, useCurrentPosition, cancellationToken);
     }
 
     [McpServerTool, Description("Clear cached materialized results for a completed InventoryList BotTask.")]

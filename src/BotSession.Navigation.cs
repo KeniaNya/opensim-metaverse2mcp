@@ -495,6 +495,67 @@ internal sealed partial class BotSession {
         return TeleportToAsync(DefaultLandingPointX, DefaultLandingPointY, DefaultLandingPointZ, regionName, cancellationToken);
     }
 
+    public async Task<BotToolResult> TeleportToLandmarkAsync(string landmarkIdOrName, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(landmarkIdOrName))
+        {
+            return BotToolResult.Fail("landmarkIdOrName is required.");
+        }
+
+        return await ExecuteLockedAsync(async (client, token) =>
+        {
+            var resolved = await ResolveLandmarkReferenceAsync(client, landmarkIdOrName, token).ConfigureAwait(false);
+            if (!resolved.Ok)
+            {
+                var resolveMessage = resolved.ErrorMessage ?? "Failed to resolve landmark reference.";
+                EmitRuntimeEvent(
+                    "teleport",
+                    "teleport.failed",
+                    "opensim",
+                    resolveMessage,
+                    new Dictionary<string, string?>
+                    {
+                        ["targetLandmark"] = landmarkIdOrName.Trim()
+                    });
+                return BotToolResult.Fail(resolveMessage);
+            }
+
+            var destinationLabel = resolved.DisplayName;
+            Console.WriteLine($"[teleport] Teleporting to landmark {destinationLabel} (asset {resolved.AssetId}).");
+
+            var ok = await client.Self.TeleportAsync(resolved.AssetId, token).ConfigureAwait(false);
+            if (!ok)
+            {
+                var message = BuildTeleportFailureMessage(client.Self.TeleportMessage, $"landmark {destinationLabel}");
+                EmitRuntimeEvent(
+                    "teleport",
+                    "teleport.failed",
+                    "opensim",
+                    message,
+                    new Dictionary<string, string?>
+                    {
+                        ["targetLandmark"] = destinationLabel,
+                        ["targetLandmarkAssetId"] = resolved.AssetId.ToString()
+                    });
+                return BotToolResult.Fail(message);
+            }
+
+            var at = client.Self.SimPosition;
+            EmitRuntimeEvent(
+                "teleport",
+                "teleport.succeeded",
+                "opensim",
+                $"Teleported to landmark {destinationLabel} at {FormatVector(at)}.",
+                new Dictionary<string, string?>
+                {
+                    ["targetLandmark"] = destinationLabel,
+                    ["targetLandmarkAssetId"] = resolved.AssetId.ToString(),
+                    ["position"] = FormatVector(at)
+                });
+            return BotToolResult.OkResult($"Teleported to landmark {destinationLabel} at {FormatVector(at)}.");
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task<BotToolResult> StopMovementAsync(CancellationToken cancellationToken)
     {
         StopFollowInternal();
