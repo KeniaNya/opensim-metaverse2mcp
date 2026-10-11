@@ -67,6 +67,28 @@ internal sealed class AgentLocator
             StringComparison.OrdinalIgnoreCase);
     }
 
+    public void Shutdown()
+    {
+        foreach (var handle in _latestStatusByHandle.Keys)
+        {
+            try
+            {
+                _bot.CancelBotTask(handle);
+            }
+            catch
+            {
+                // Best effort during shutdown.
+            }
+        }
+
+        _latestStatusByHandle.Clear();
+        _latestCoarsePresenceByRegionHandle.Clear();
+        _agentIdByNameCache.Clear();
+        _agentNameByIdCache.Clear();
+        _cachedExternalFallbackResult = null;
+        _lastExternalProbeAtUtc = DateTime.MinValue;
+    }
+
     private void LogDiag(string message)
     {
         Console.WriteLine($"[agent-locator][diag] {message}");

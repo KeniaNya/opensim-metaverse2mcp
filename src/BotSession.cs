@@ -582,13 +582,28 @@ internal sealed partial class BotSession : IDisposable
         }
 
         var client = _client;
+        _client = null;
+        _connected = false;
+
+        // Stop high-level runtime flows first so they do not keep producing events.
+        ShutdownAgentLocatorTasks();
+        StopFollowInternal();
+        CancelFollowRelatedTasks();
+        CancelMovementAutoStop();
+
+        // Runtime event stream/monitor state is local to this bot session.
+        _objectMonitors.Clear();
+        _eventSubscriptions.Clear();
+        _objectEventThrottle.Clear();
+
         if (_harnessClient != null)
         {
             _harnessClient.SessionStatusChanged -= OnHarnessSessionStatusChanged;
             _harnessClient.MessagePartUpdated -= OnHarnessMessagePartUpdated;
         }
-        _userResponseHandler.Dispose();
-        StopTypingIndicatorIfActive();
+
+        try { _userResponseHandler.Dispose(); } catch { }
+        try { StopTypingIndicatorIfActive(); } catch { }
         foreach (var cts in _inFlightRequestCtsByConversation.Values)
         {
             try
@@ -607,41 +622,61 @@ internal sealed partial class BotSession : IDisposable
 
         _inFlightRequestCtsByConversation.Clear();
         __busyHarnessSessions.Clear();
-        ClearBusyHoverText();
-        DisposeVoiceSupport();
-        ResetSharedCurrentOutfitFolder();
-        _client = null;
-        _connected = false;
-        StopFollowInternal();
-        CancelMovementAutoStop();
-        _followSpawnerClient.Dispose();
-        _botTaskManager.Dispose();
+        try { ClearBusyHoverText(); } catch { }
+        try { DisposeVoiceSupport(); } catch { }
+        try { ResetSharedCurrentOutfitFolder(); } catch { }
 
-        if (client == null)
+        try
         {
-            _connectGate.Dispose();
-            _lifecycleCts.Dispose();
-            if (_harnessClient is IDisposable disposableWhenNoClient)
+            if (client != null)
             {
-                disposableWhenNoClient.Dispose();
+                CleanupClient(client, logout: true);
             }
-            return;
+        }
+        catch
+        {
+            // Best effort during shutdown.
         }
 
-        CleanupClient(client, logout: true);
-        _connectGate.Dispose();
-        _lifecycleCts.Dispose();
-        if (_harnessClient is IDisposable dsp)
+        try { _agentLocator.Shutdown(); } catch { }
+        try { _followSpawnerClient.Dispose(); } catch { }
+        try { _botTaskManager.Dispose(); } catch { }
+        try { _connectGate.Dispose(); } catch { }
+        try { _lifecycleCts.Dispose(); } catch { }
+        if (_harnessClient is IDisposable harnessDisposable)
         {
-            dsp.Dispose();
+            try { harnessDisposable.Dispose(); } catch { }
         }
 
         foreach (var gate in _conversationLocks.Values)
         {
-            gate.Dispose();
+            try { gate.Dispose(); } catch { }
         }
 
-        _actionGate.Dispose();
+        try { _globalConversationGate.Dispose(); } catch { }
+        try { _actionGate.Dispose(); } catch { }
+    }
+
+    private void ShutdownAgentLocatorTasks()
+    {
+        foreach (var task in _botTaskManager.ListActive())
+        {
+            if (task.Description.StartsWith("Monitor agent", StringComparison.OrdinalIgnoreCase))
+            {
+                _botTaskManager.TryCancel(task.Handle, out _);
+            }
+        }
+    }
+
+    private void CancelFollowRelatedTasks()
+    {
+        foreach (var task in _botTaskManager.ListActive())
+        {
+            if (task.Description.Contains("follow", StringComparison.OrdinalIgnoreCase))
+            {
+                _botTaskManager.TryCancel(task.Handle, out _);
+            }
+        }
     }
 
     private async Task<BotToolResult> RunActionAsync(string successMessage, Action<GridClient> action, CancellationToken cancellationToken)
