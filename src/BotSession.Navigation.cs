@@ -376,36 +376,38 @@ internal sealed partial class BotSession {
             }
             else
             {
-                /*
-                var region = await client.Grid.GetGridRegionAsync(regionName, GridLayerType.Objects, token).ConfigureAwait(false);
-                if (!region.HasValue)
+                var requestedRegionName = regionName.Trim();
+                var region = await client.Grid.GetGridRegionAsync(requestedRegionName, GridLayerType.Objects, token).ConfigureAwait(false);
+                if (region == null)
                 {
-                    return BotToolResult.Fail($"Unable to resolve region '{regionName}' to a region handle.");
+                    var resolveMessage = $"Unable to resolve destination region '{requestedRegionName}'. It may not exist or map data is unavailable.";
+                    EmitRuntimeEvent(
+                        "teleport",
+                        "teleport.failed",
+                        "opensim",
+                        resolveMessage,
+                        new Dictionary<string, string?>
+                        {
+                            ["targetRegion"] = requestedRegionName,
+                            ["targetPosition"] = FormatVector(new Vector3(x, y, z))
+                        });
+                    return BotToolResult.Fail(resolveMessage);
                 }
 
-                // GridRegion carries no size fields in LibreMetaverse 3.1.6, so
-                // the destination's extent is unknown before connecting. Clamp
-                // to the maximum varregion extent and let the destination
-                // simulator resolve the final landing point (viewer behavior).
+                // Destination region size is unknown pre-teleport; clamp against
+                // maximum varregion extent and let simulator-side routing resolve final landing.
                 target = ClampLocalPosition(new Vector3(x, y, z), MaxRegionExtent, MaxRegionExtent);
                 destinationLabel = $"{region.Value.Name} ({region.Value.RegionHandle})";
-                ok = await client.Self.TeleportAsync(region.Value.RegionHandle, target, token).ConfigureAwait(false);
-                */
-                
-                target = ClampLocalPosition(new Vector3(x, y, z), MaxRegionExtent, MaxRegionExtent);
-                destinationLabel = regionName;
                 
                 Console.WriteLine($"[teleport] Teleporting to {destinationLabel} at {FormatVector(target)}.");
                 
-                ok = await client.Self.TeleportAsync(regionName, target, token).ConfigureAwait(false);
+                ok = await client.Self.TeleportAsync(region.Value.RegionHandle, target, token).ConfigureAwait(false);
             }
 
             if (!ok)
             {
                 Console.WriteLine($"[teleport] Teleport failed to {destinationLabel} at {FormatVector(target)}.");
-                var message = string.IsNullOrWhiteSpace(client.Self.TeleportMessage)
-                    ? "Teleport failed."
-                    : client.Self.TeleportMessage;
+                var message = BuildTeleportFailureMessage(client.Self.TeleportMessage, destinationLabel);
                 EmitRuntimeEvent(
                     "teleport",
                     "teleport.failed",
@@ -456,9 +458,7 @@ internal sealed partial class BotSession {
             if (!ok)
             {
                 Console.WriteLine($"[teleport] Teleport failed to region handle {handle} at {FormatVector(target)}.");
-                var message = string.IsNullOrWhiteSpace(client.Self.TeleportMessage)
-                    ? "Teleport failed."
-                    : client.Self.TeleportMessage;
+                var message = BuildTeleportFailureMessage(client.Self.TeleportMessage, $"region handle {handle}");
                 EmitRuntimeEvent(
                     "teleport",
                     "teleport.failed",
@@ -486,6 +486,13 @@ internal sealed partial class BotSession {
                 });
             return BotToolResult.OkResult($"Teleported to region handle {handle} at {FormatVector(client.Self.SimPosition)}.");
         }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public Task<BotToolResult> TeleportToLandingPointAsync(string? regionName, CancellationToken cancellationToken)
+    {
+        // Request default arrival behavior using region-center coordinates.
+        // Parcel routing/telehubs can still redirect to landing points.
+        return TeleportToAsync(DefaultLandingPointX, DefaultLandingPointY, DefaultLandingPointZ, regionName, cancellationToken);
     }
 
     public async Task<BotToolResult> StopMovementAsync(CancellationToken cancellationToken)
@@ -2382,6 +2389,20 @@ internal sealed partial class BotSession {
     }
 
     private const uint MaxRegionExtent = 4096;
+    private const float DefaultLandingPointX = 128f;
+    private const float DefaultLandingPointY = 128f;
+    private const float DefaultLandingPointZ = 0f;
+
+    private static string BuildTeleportFailureMessage(string? rawMessage, string destinationLabel)
+    {
+        var message = string.IsNullOrWhiteSpace(rawMessage) ? "Teleport failed." : rawMessage.Trim();
+        if (message.Equals("Teleport timed out.", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"Teleport to {destinationLabel} timed out (no response from destination). Possible causes: region down/unreachable, access denied, or invalid destination.";
+        }
+
+        return message;
+    }
 
     private Vector3 ClampLocalPosition(Vector3 pos)
     {

@@ -37,6 +37,7 @@ The server publishes tools including:
 - `WalkTo`
 - `FlyTo`
 - `TeleportTo`
+- `TeleportToLandingPoint`
 - `TeleportToRegionHandle`
 - `RegionUuid`
 - `Map`

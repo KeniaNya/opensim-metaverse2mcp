@@ -1535,7 +1535,7 @@ internal sealed class BotMcpTools
         return _bot.MoveToAsync(x, y, z, true, cancellationToken);
     }
 
-    [McpServerTool, Description("Teleport to an absolute local position, optionally in a named region.")]
+    [McpServerTool, Description("Teleport to a local position, optionally in a named region.")]
     public Task<BotToolResult> TeleportTo(
         [Description("Local X coordinate (0..256).") ] float x,
         [Description("Local Y coordinate (0..256).") ] float y,
@@ -1543,7 +1543,15 @@ internal sealed class BotMcpTools
         [Description("Optional destination region name. If omitted, current region is used.")] string? regionName = null,
         CancellationToken cancellationToken = default)
     {
-        return _bot.TeleportToAsync(x, y, z, regionName, CancellationToken.None);
+        return _bot.TeleportToAsync(x, y, z, regionName, cancellationToken);
+    }
+
+    [McpServerTool, Description("Teleport to a region's default arrival/landing point without specifying XYZ coordinates.")]
+    public Task<BotToolResult> TeleportToLandingPoint(
+        [Description("Optional destination region name. If omitted, current region is used.")] string? regionName = null,
+        CancellationToken cancellationToken = default)
+    {
+        return _bot.TeleportToLandingPointAsync(regionName, cancellationToken);
     }
 
     [McpServerTool, Description("Teleport to a region handle and local position.")]
@@ -1554,7 +1562,7 @@ internal sealed class BotMcpTools
         [Description("Local Z coordinate.")] float z,
         CancellationToken cancellationToken = default)
     {
-        return _bot.TeleportToRegionHandleAsync(regionHandle, x, y, z, CancellationToken.None);
+        return _bot.TeleportToRegionHandleAsync(regionHandle, x, y, z, cancellationToken);
     }
 
     [McpServerTool, Description("Stop current movement by canceling autopilot and resetting movement control flags.")]
