@@ -15,7 +15,8 @@ internal sealed partial class BotSession {
     private const float CrossRegionSeamOvershootMeters = 8f;
     private const float CrossRegionWaypointMinLocal = -64f;
     private const float CrossRegionWaypointMaxLocal = 320f;
-    private static readonly TimeSpan CrossRegionMovementReissueInterval = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan FollowTickInterval = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan FollowDirectionalHeartbeatInterval = TimeSpan.FromMilliseconds(100);
     private readonly object _movementLock = new();
     private CancellationTokenSource? _movementAutoStopCts;
     private string? _activeFollowTaskHandle;
@@ -26,6 +27,15 @@ internal sealed partial class BotSession {
     private bool? _lastDirectionalUpPos;
     private bool? _lastDirectionalUpNeg;
     private bool? _lastDirectionalFastUp;
+    private MovementControlOwner _movementControlOwner = MovementControlOwner.None;
+    private DateTime _lastFollowControlHeartbeatAt = DateTime.MinValue;
+
+    private enum MovementControlOwner
+    {
+        None,
+        Immediate,
+        Follow
+    }
 
     private enum FollowMode
     {
@@ -487,12 +497,15 @@ internal sealed partial class BotSession {
             client.Self.AutoPilotCancel();
             client.Self.Movement.ResetControlFlags();
             client.Self.Movement.SendUpdate(true);
+            ReleaseMovementControlOwner(MovementControlOwner.Immediate);
+            ReleaseMovementControlOwner(MovementControlOwner.Follow);
             return Task.FromResult(BotToolResult.OkResult("Movement stopped (autopilot canceled, control flags reset, follow stopped)."));
         }, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<BotToolResult> StartMovementAsync(string axis, bool fast, float? durationSeconds, CancellationToken cancellationToken)
     {
+        StopFollowInternal();
         if (!TryResolveMovementAxis(axis, fast, out var flags, out var axisError))
         {
             return BotToolResult.Fail(axisError);
@@ -500,6 +513,7 @@ internal sealed partial class BotSession {
 
         return await ExecuteLockedAsync((client, _) =>
         {
+            AcquireMovementControlOwner(MovementControlOwner.Immediate);
             var movement = client.Self.Movement;
             movement.AtPos = (flags & AgentManager.ControlFlags.AGENT_CONTROL_AT_POS) != 0;
             movement.AtNeg = (flags & AgentManager.ControlFlags.AGENT_CONTROL_AT_NEG) != 0;
@@ -710,6 +724,7 @@ internal sealed partial class BotSession {
     private void SetupFollowLoop(string followTaskHandle, string? monitorTaskHandle, GridClient client, Simulator sim, bool isObject, UUID trackedId, uint localId, string label)
     {
         StopFollowInternal();
+        AcquireMovementControlOwner(MovementControlOwner.Follow);
         lock (_movementLock)
         {
             _activeFollowTaskHandle = followTaskHandle;
@@ -834,7 +849,7 @@ internal sealed partial class BotSession {
             }
         }
 
-        // Stage 3: Main follow tick loop (500ms cadence).
+        // Stage 3: Main follow tick loop (100ms cadence).
         // Each tick resolves target state, chooses a waypoint, evaluates
         // cross-region state-machine transitions, then drives movement.
         var completion = BotToolResult.OkResult($"Follow ended for {label}.");
@@ -842,7 +857,7 @@ internal sealed partial class BotSession {
         {
             try
             {
-                await Task.Delay(500, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(FollowTickInterval, cancellationToken).ConfigureAwait(false);
 
                 var botSim = client.Network.CurrentSim;
                 if (botSim == null)
@@ -1418,12 +1433,8 @@ internal sealed partial class BotSession {
                     }
 
                     // Stage 3h: Normal movement command emission.
-                    // Re-issue movement frequently during seam pressure and at most once per second otherwise.
-                    var movementReissueInterval = targetIsCrossRegion
-                        ? CrossRegionMovementReissueInterval
-                        : TimeSpan.FromSeconds(1);
-                    if (!holdPositionForTeleportAssist
-                        && (DateTime.UtcNow - lastPilotAt) >= movementReissueInterval)
+                    // Reassert directional controls each follow tick so movement is continuous.
+                    if (!holdPositionForTeleportAssist)
                     {
                         var movementModeToApply = targetIsCrossRegion && IsCrossRegionPhase(followMovementMode)
                             ? followMovementMode
@@ -1431,11 +1442,13 @@ internal sealed partial class BotSession {
 
                         ApplyFollowLocomotionMode(client, movementModeToApply);
 
+                        // Avoid mixing autopilot steering with directional control ownership.
+                        client.Self.AutoPilotCancel();
+
                         if (targetIsCrossRegion)
                         {
                             // Drive seam crossing with directional controls toward the projected waypoint.
                             // targetPos is derived from target region handle/local and projected into this sim.
-                            client.Self.AutoPilotCancel();
                             var directionalApplied = ApplyFollowDirectionalControls(
                                 client,
                                 targetPos,
@@ -1462,29 +1475,13 @@ internal sealed partial class BotSession {
                         }
                         else
                         {
-                            // Prefer autopilot for normal walking to reduce target bumping.
-                            if (IsWalkPhase(movementModeToApply))
+                            if (!ApplyFollowDirectionalControls(client, targetPos, movementModeToApply, out _))
                             {
                                 ClearDirectionalFollowCache();
                                 client.Self.AutoPilotLocal(
                                     (int)MathF.Round(targetPos.X),
                                     (int)MathF.Round(targetPos.Y),
                                     targetPos.Z);
-                            }
-                            else
-                            {
-                                // Clear any previous AutoPilot target before directional movement.
-                                // Without this, stale AutoPilot steering can override/compete with AtPos follow controls.
-                                client.Self.AutoPilotCancel();
-
-                                if (!ApplyFollowDirectionalControls(client, targetPos, movementModeToApply, out _))
-                                {
-                                    ClearDirectionalFollowCache();
-                                    client.Self.AutoPilotLocal(
-                                        (int)MathF.Round(targetPos.X),
-                                        (int)MathF.Round(targetPos.Y),
-                                        targetPos.Z);
-                                }
                             }
                         }
                         if (IsFollowDiagnosticsEnabled())
@@ -1525,6 +1522,7 @@ internal sealed partial class BotSession {
             client.Self.Movement.ResetControlFlags();
             client.Self.Movement.SendUpdate(true);
             ClearDirectionalFollowCache();
+            ReleaseMovementControlOwner(MovementControlOwner.Follow);
         }
         catch
         {
@@ -1691,6 +1689,35 @@ internal sealed partial class BotSession {
         _lastDirectionalFastUp = null;
     }
 
+    private void AcquireMovementControlOwner(MovementControlOwner owner)
+    {
+        lock (_movementLock)
+        {
+            _movementControlOwner = owner;
+            if (owner == MovementControlOwner.Follow)
+            {
+                _lastFollowControlHeartbeatAt = DateTime.MinValue;
+            }
+        }
+    }
+
+    private void ReleaseMovementControlOwner(MovementControlOwner owner)
+    {
+        lock (_movementLock)
+        {
+            if (_movementControlOwner != owner)
+            {
+                return;
+            }
+
+            _movementControlOwner = MovementControlOwner.None;
+            if (owner == MovementControlOwner.Follow)
+            {
+                _lastFollowControlHeartbeatAt = DateTime.MinValue;
+            }
+        }
+    }
+
     private bool ApplyFollowDirectionalControls(
         GridClient client,
         Vector3 targetPos,
@@ -1704,6 +1731,14 @@ internal sealed partial class BotSession {
         if (!client.Settings.Agent.SendUpdates)
         {
             return false;
+        }
+
+        lock (_movementLock)
+        {
+            if (_movementControlOwner != MovementControlOwner.Follow)
+            {
+                return false;
+            }
         }
 
         var delta = targetPos - client.Self.SimPosition;
@@ -1765,13 +1800,25 @@ internal sealed partial class BotSession {
             || _lastDirectionalUpNeg != movement.UpNeg
             || _lastDirectionalFastUp != movement.FastUp;
 
-        if (directionalStateChanged || shouldMoveForward)
+        var now = DateTime.UtcNow;
+        var dueHeartbeat = false;
+        lock (_movementLock)
+        {
+            dueHeartbeat = _lastFollowControlHeartbeatAt == DateTime.MinValue
+                || (now - _lastFollowControlHeartbeatAt) >= FollowDirectionalHeartbeatInterval;
+        }
+
+        if (directionalStateChanged || shouldMoveForward || dueHeartbeat)
         {
             movement.SendUpdate(true);
             _lastDirectionalAtPos = movement.AtPos;
             _lastDirectionalUpPos = movement.UpPos;
             _lastDirectionalUpNeg = movement.UpNeg;
             _lastDirectionalFastUp = movement.FastUp;
+            lock (_movementLock)
+            {
+                _lastFollowControlHeartbeatAt = now;
+            }
         }
 
         return true;
@@ -2309,8 +2356,8 @@ internal sealed partial class BotSession {
         {
             case FollowMode.Flying:
                 client.Self.Fly(true);
-                client.Self.Movement.FastAt = false;
-                client.Self.Movement.FastLeft = false;
+                client.Self.Movement.FastAt = true;
+                client.Self.Movement.FastLeft = true;
                 client.Self.Movement.AlwaysRun = false;
                 client.Self.Movement.SendUpdate(true);
                 break;
