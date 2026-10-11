@@ -760,9 +760,6 @@ internal sealed partial class BotSession {
         var teleportRequestSent = false;
         ulong lastKnownCrossRegionHandle = 0;
         var lastKnownCrossRegionLocal = Vector3.Zero;
-        ulong seamLockTargetHandle = 0;
-        bool? seamLockPushEastWest = null;
-        var seamLockDirection = 0;
         var followStartRegionHandle = followSetup.Simulator.Handle;
         var followStartLocal = ClampLocalPosition(client.Self.SimPosition);
         var avatarLost = false;
@@ -775,39 +772,6 @@ internal sealed partial class BotSession {
         var sameRegionLastRecoveryAt = DateTime.MinValue;
         var lastObservedCrossingState = AgentManager.CrossingState.Idle;
         var observedCrossingStateSince = DateTime.UtcNow;
-
-        void ResetSeamLock()
-        {
-            seamLockTargetHandle = 0;
-            seamLockPushEastWest = null;
-            seamLockDirection = 0;
-        }
-
-        void AcquireSeamLock(Simulator botSimulator, Vector3 botLocalPosition, ulong targetHandle, Vector3 targetLocalPosition, string reason)
-        {
-            if (targetHandle == 0)
-            {
-                return;
-            }
-
-            var botGlobal = ToGlobalPosition(botSimulator.Handle, botLocalPosition);
-            var targetGlobal = ToGlobalPosition(targetHandle, targetLocalPosition);
-            var globalDelta = targetGlobal - botGlobal;
-            var pushEastWest = MathF.Abs(globalDelta.X) >= MathF.Abs(globalDelta.Y);
-            var direction = pushEastWest
-                ? (globalDelta.X >= 0f ? 1 : -1)
-                : (globalDelta.Y >= 0f ? 1 : -1);
-
-            seamLockTargetHandle = targetHandle;
-            seamLockPushEastWest = pushEastWest;
-            seamLockDirection = direction;
-
-            if (IsFollowDiagnosticsEnabled())
-            {
-                Console.WriteLine(
-                    $"[follow][diag] seam_lock_acquired target={label} reason={reason} targetHandle={targetHandle} axis={(pushEastWest ? "x" : "y")} direction={(direction >= 0 ? "+" : "-")} botPos={FormatPosition(botLocalPosition)} targetLocal={FormatPosition(targetLocalPosition)} deltaGlobal={FormatPosition(globalDelta)}");
-            }
-        }
 
         // Stage 2: Hard-stop helper for hold states and cleanup transitions.
         // preserveFlight is used when we intentionally keep hover mode active.
@@ -1025,19 +989,13 @@ internal sealed partial class BotSession {
                         lastKnownCrossRegionHandle = statusRegionHandle;
                         lastKnownCrossRegionLocal = statusPosition;
 
-                        var hasSeamLock = seamLockTargetHandle == statusRegionHandle
-                            && seamLockPushEastWest.HasValue
-                            && seamLockDirection != 0;
-
                         targetPos = ResolveFollowWaypointFromRegionHandle(
                             botSim,
                             client.Self.SimPosition,
                             statusRegionHandle,
                             statusPosition,
                             out distance,
-                            out targetIsCrossRegion,
-                            hasSeamLock ? seamLockPushEastWest : null,
-                            hasSeamLock ? seamLockDirection : 0);
+                            out targetIsCrossRegion);
 
                         var deltaZ = MathF.Abs(statusPosition.Z - client.Self.SimPosition.Z);
                         // Start running much earlier so the bot does not close too aggressively right near the target.
@@ -1131,19 +1089,13 @@ internal sealed partial class BotSession {
                         crossRegionTargetHandle = offRegionHandle;
                         crossRegionTargetLocal = lastKnownCrossRegionLocal;
 
-                        var hasSeamLock = seamLockTargetHandle == crossRegionTargetHandle
-                            && seamLockPushEastWest.HasValue
-                            && seamLockDirection != 0;
-
                         targetPos = ResolveFollowWaypointFromRegionHandle(
                             botSim,
                             client.Self.SimPosition,
                             crossRegionTargetHandle,
                             crossRegionTargetLocal,
                             out distance,
-                            out targetIsCrossRegion,
-                            hasSeamLock ? seamLockPushEastWest : null,
-                            hasSeamLock ? seamLockDirection : 0);
+                            out targetIsCrossRegion);
                     }
                 }
 
@@ -1159,18 +1111,6 @@ internal sealed partial class BotSession {
                 {
                     // Stage 3e: Cross-region state machine.
                     // Walk to seam -> teleport attempts -> teleport assist.
-                    if (crossRegionTargetHandle != 0
-                        && seamLockTargetHandle != 0
-                        && seamLockTargetHandle != crossRegionTargetHandle)
-                    {
-                        AcquireSeamLock(
-                            botSim,
-                            client.Self.SimPosition,
-                            crossRegionTargetHandle,
-                            crossRegionTargetLocal,
-                            "target_handle_changed");
-                    }
-
                     if (crossRegionTargetHandle != 0)
                     {
                         lastKnownCrossRegionHandle = crossRegionTargetHandle;
@@ -1185,13 +1125,6 @@ internal sealed partial class BotSession {
                         lastCrossRegionProgressAt = DateTime.UtcNow;
                         crossRegionTeleportAttempts = 0;
                         teleportRequestSent = false;
-                        AcquireSeamLock(
-                            botSim,
-                            client.Self.SimPosition,
-                            crossRegionTargetHandle,
-                            crossRegionTargetLocal,
-                            "cross_region_start");
-                        
                         if (IsFollowDiagnosticsEnabled())
                         {
                             Console.WriteLine(
@@ -1364,7 +1297,6 @@ internal sealed partial class BotSession {
                     crossRegionTeleportAttempts = 0;
                     teleportRequestSent = false;
                     lastKnownCrossRegionHandle = 0;
-                    ResetSeamLock();
 
                     if (distance < sameRegionBestDistance - FollowSameRegionProgressEpsilonMeters)
                     {
@@ -1550,9 +1482,7 @@ internal sealed partial class BotSession {
         ulong targetRegionHandle,
         Vector3 targetLocalPosition,
         out float distance,
-        out bool crossRegion,
-        bool? seamLockPushEastWest = null,
-        int seamLockDirection = 0)
+        out bool crossRegion)
     {
         crossRegion = botSim.Handle != targetRegionHandle;
         if (!crossRegion)
@@ -1571,35 +1501,28 @@ internal sealed partial class BotSession {
             botPosition.Y + delta.Y,
             botPosition.Z + Math.Clamp(delta.Z, -3f, 3f));
 
-        return BuildCrossRegionSeamWaypoint(projectedLocal, delta, seamLockPushEastWest, seamLockDirection);
+        return BuildCrossRegionSeamWaypoint(projectedLocal, delta);
     }
 
     private static Vector3 BuildCrossRegionSeamWaypoint(
         Vector3 projectedLocal,
-        Vector3 delta,
-        bool? seamLockPushEastWest = null,
-        int seamLockDirection = 0)
+        Vector3 delta)
     {
         var waypoint = ClampEdgeWaypoint(projectedLocal);
         var adjustedX = waypoint.X;
         var adjustedY = waypoint.Y;
-        var pushEastWest = seamLockPushEastWest ?? (MathF.Abs(delta.X) >= MathF.Abs(delta.Y));
-        var lockDirection = seamLockDirection == 0 ? 0 : Math.Sign(seamLockDirection);
+        var pushEastWest = MathF.Abs(delta.X) >= MathF.Abs(delta.Y);
 
         if (pushEastWest)
         {
-            var eastWestDirection = lockDirection != 0
-                ? lockDirection
-                : (delta.X >= 0f ? 1 : -1);
+            var eastWestDirection = delta.X >= 0f ? 1 : -1;
             adjustedX = eastWestDirection >= 0
                 ? 256f + CrossRegionSeamOvershootMeters
                 : -CrossRegionSeamOvershootMeters;
         }
         else
         {
-            var northSouthDirection = lockDirection != 0
-                ? lockDirection
-                : (delta.Y >= 0f ? 1 : -1);
+            var northSouthDirection = delta.Y >= 0f ? 1 : -1;
             adjustedY = northSouthDirection >= 0
                 ? 256f + CrossRegionSeamOvershootMeters
                 : -CrossRegionSeamOvershootMeters;
@@ -1747,13 +1670,18 @@ internal sealed partial class BotSession {
         // For cross-region movement, derive facing from world-space direction.
         // Keep this unclamped so west/south seam crossings do not flip heading backward.
         var currentSim = client.Network.CurrentSim;
-        if (targetRegionHandle.HasValue
+        var crossRegionTargetHandle = targetRegionHandle.GetValueOrDefault();
+        var isCrossRegionDirectional = targetRegionHandle.HasValue
             && targetRegionLocal.HasValue
             && currentSim != null
-            && currentSim.Handle != targetRegionHandle.Value)
+            && currentSim.Handle != crossRegionTargetHandle;
+
+        if (isCrossRegionDirectional
+            && targetRegionLocal.HasValue
+            && currentSim != null)
         {
             var botGlobal = ToGlobalPosition(currentSim.Handle, client.Self.SimPosition);
-            var targetGlobal = ToGlobalPosition(targetRegionHandle.Value, targetRegionLocal.Value);
+            var targetGlobal = ToGlobalPosition(crossRegionTargetHandle, targetRegionLocal.Value);
             var worldDelta = targetGlobal - botGlobal;
             var planarWorldDelta = new Vector3(worldDelta.X, worldDelta.Y, 0f);
 
