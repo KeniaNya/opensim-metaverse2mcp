@@ -429,76 +429,70 @@ internal sealed partial class BotSession
 
     private void OnWorldObjectUpdateForEventStream(object? sender, PrimEventArgs e)
     {
-        // TODO very similar to OnTerseWorldObjectUpdateForEventStream
-        var prim = e.Prim;
-        if (prim == null)
-        {
-            return;
-        }
-
-        var objectId = prim.ID;
-        if (objectId == UUID.Zero)
-        {
-            return;
-        }
-
-        var throttleKey ="object.updated";
-        var now = DateTimeOffset.UtcNow;
-        if (_objectEventThrottle.TryGetValue(throttleKey, out var lastSeen)
-            && (now - lastSeen).TotalMilliseconds < EventStreamObjectMinIntervalMs)
-        {
-            return;
-        }
-
-        _objectEventThrottle[throttleKey] = now;
-        if (_objectEventThrottle.Count > 8000)
-        {
-            var cutoff = now - TimeSpan.FromMinutes(5);
-            foreach (var item in _objectEventThrottle)
-            {
-                if (item.Value < cutoff)
-                {
-                    _objectEventThrottle.TryRemove(item.Key, out _);
-                }
-            }
-        }
-
-        EmitRuntimeEvent(
-            "object",
+        EmitObjectUpdateEvent(
+            e.Prim,
+            e.Simulator,
             "object.updated",
-            "opensim",
-            $"Object update for {objectId}.",
-            new Dictionary<string, string?>
-            {
-                ["objectId"] = objectId.ToString(),
-                ["localId"] = prim.LocalID.ToString(CultureInfo.InvariantCulture),
-                ["name"] = string.IsNullOrWhiteSpace(prim.Properties?.Name) ? null : prim.Properties?.Name,
-                ["simulator"] = e.Simulator?.Name,
-                ["position"] = $"{prim.Position.X:0.###},{prim.Position.Y:0.###},{prim.Position.Z:0.###}"
-            });
+            "object.updated",
+            objectId => $"Object update for {objectId}.");
     }
     
     private void OnTerseWorldObjectUpdateForEventStream(object? sender, TerseObjectUpdateEventArgs e)
     {
-        // TODO very similar to OnWorldObjectUpdateForEventStream
-        var prim = e.Prim;
+        EmitObjectUpdateEvent(
+            e.Prim,
+            e.Simulator,
+            "object.terse.updated",
+            "object.terse.updated",
+            objectId => $"Terse object update for {objectId}.");
+    }
+
+    private void EmitObjectUpdateEvent(
+        Primitive? prim,
+        Simulator? simulator,
+        string throttleKey,
+        string eventType,
+        Func<UUID, string> messageFactory)
+    {
         if (prim == null)
         {
             return;
         }
 
         var objectId = prim.ID;
-        if (objectId == UUID.Zero)
+        if (objectId == UUID.Zero || !TryAcquireObjectEventThrottle(throttleKey))
         {
             return;
         }
 
-        var throttleKey ="object.terse.updated";
+        var localPosition = prim.Position;
+        var worldPosition = ResolvePrimWorldPosition(prim, simulator);
+
+        EmitRuntimeEvent(
+            "object",
+            eventType,
+            "opensim",
+            messageFactory(objectId),
+            new Dictionary<string, string?>
+            {
+                ["objectId"] = objectId.ToString(),
+                ["localId"] = prim.LocalID.ToString(CultureInfo.InvariantCulture),
+                ["parentLocalId"] = prim.ParentID.ToString(CultureInfo.InvariantCulture),
+                ["name"] = string.IsNullOrWhiteSpace(prim.Properties?.Name) ? null : prim.Properties?.Name,
+                ["simulator"] = simulator?.Name,
+                ["position"] = FormatVector3(worldPosition),
+                ["positionWorld"] = FormatVector3(worldPosition),
+                ["positionLocal"] = FormatVector3(localPosition)
+            });
+    }
+
+    private bool TryAcquireObjectEventThrottle(string throttleKey)
+    {
         var now = DateTimeOffset.UtcNow;
         if (_objectEventThrottle.TryGetValue(throttleKey, out var lastSeen)
             && (now - lastSeen).TotalMilliseconds < EventStreamObjectMinIntervalMs)
         {
-            return;
+            return false;
         }
 
         _objectEventThrottle[throttleKey] = now;
@@ -514,19 +508,40 @@ internal sealed partial class BotSession
             }
         }
 
-        EmitRuntimeEvent(
-            "object",
-            "object.terse.updated",
-            "opensim",
-            $"Tersee object update for {objectId}.",
-            new Dictionary<string, string?>
-            {
-                ["objectId"] = objectId.ToString(),
-                ["localId"] = prim.LocalID.ToString(CultureInfo.InvariantCulture),
-                ["name"] = string.IsNullOrWhiteSpace(prim.Properties?.Name) ? null : prim.Properties?.Name,
-                ["simulator"] = e.Simulator?.Name,
-                ["position"] = $"{prim.Position.X:0.###},{prim.Position.Y:0.###},{prim.Position.Z:0.###}"
-            });
+        return true;
+    }
+
+    private static string FormatVector3(Vector3 value)
+    {
+        return string.Create(
+            CultureInfo.InvariantCulture,
+            $"{value.X:0.###},{value.Y:0.###},{value.Z:0.###}");
+    }
+
+    private static Vector3 ResolvePrimWorldPosition(Primitive prim, Simulator? simulator)
+    {
+        if (prim.ParentID == 0 || simulator == null)
+        {
+            return prim.Position;
+        }
+
+        var worldPosition = prim.Position;
+        var parentLocalId = prim.ParentID;
+        var visited = new HashSet<uint>();
+        var depth = 0;
+
+        // Child prim positions are local offsets; walk parent chain to map into simulator space.
+        while (parentLocalId != 0
+               && depth < 16
+               && visited.Add(parentLocalId)
+               && simulator.ObjectsPrimitives.TryGetValue(parentLocalId, out var parent))
+        {
+            worldPosition = (worldPosition * parent.Rotation) + parent.Position;
+            parentLocalId = parent.ParentID;
+            depth++;
+        }
+
+        return worldPosition;
     }
 
     private static string NormalizeEventChannel(string channel)
