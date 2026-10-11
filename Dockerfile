@@ -5,8 +5,8 @@ FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG APP_CONTEXT_PATH
 ARG USE_LIBREMETAVERSE_GIT=false
 ARG LIBREMETAVERSE_SOURCE=nuget
-ARG LIBREMETAVERSE_GIT_REPO=https://github.com/cinderblocks/libremetaverse.git
-ARG LIBREMETAVERSE_GIT_REF=main
+ARG LIBREMETAVERSE_GIT_REPO=https://github.com/opensim-stack/libremetaverse.git
+ARG LIBREMETAVERSE_GIT_REF=master
 WORKDIR /src
 
 # Build source modes in this target:

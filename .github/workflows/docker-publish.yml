@@ -27,7 +27,7 @@ env:
   IMAGE_NAME: bithatch/opensim-metaverse2mcp
   USE_LIBREMETAVERSE_GIT: "true"
   LIBREMETAVERSE_GIT_REPO: https://github.com/opensim-stack/libremetaverse.git
-  LIBREMETAVERSE_GIT_REF: main
+  LIBREMETAVERSE_GIT_REF: master
 
 jobs:
   build-and-push:
