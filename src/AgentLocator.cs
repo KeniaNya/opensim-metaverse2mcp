@@ -18,6 +18,7 @@ internal sealed class AgentLocator
     private static readonly TimeSpan SingleSnapshotFriendMapTimeout = TimeSpan.FromSeconds(1.5);
     private static readonly TimeSpan ExternalFallbackProbeInterval = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan CoarsePresenceFreshnessWindow = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan RegionHandleLookupRetryDelay = TimeSpan.FromSeconds(30);
     private static readonly HashSet<UUID> FlyingAnimationIds = new()
     {
         Animations.FLY,
@@ -55,6 +56,8 @@ internal sealed class AgentLocator
     private readonly ConcurrentDictionary<ulong, CoarsePresenceSnapshot> _latestCoarsePresenceByRegionHandle = new();
     private readonly ConcurrentDictionary<string, CachedIdentityValue<UUID>> _agentIdByNameCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<UUID, CachedIdentityValue<string>> _agentNameByIdCache = new();
+    private readonly ConcurrentDictionary<ulong, string> _regionNameByHandleCache = new();
+    private readonly ConcurrentDictionary<ulong, DateTime> _regionHandleLookupCooldownByHandle = new();
     private DateTime _lastExternalProbeAtUtc = DateTime.MinValue;
 
     public AgentLocator(BotSession bot, SpawnerClient spawnerClient)
@@ -85,6 +88,8 @@ internal sealed class AgentLocator
         _latestCoarsePresenceByRegionHandle.Clear();
         _agentIdByNameCache.Clear();
         _agentNameByIdCache.Clear();
+        _regionNameByHandleCache.Clear();
+        _regionHandleLookupCooldownByHandle.Clear();
         _cachedExternalFallbackResult = null;
         _lastExternalProbeAtUtc = DateTime.MinValue;
     }
@@ -564,10 +569,11 @@ internal sealed class AgentLocator
         if (mapReply != null)
         {
             LogDiag(correlationId, $"friend-map hit target={targetId} regionHandle={mapReply.RegionHandle} pos={FormatVector(mapReply.Location)}");
+            var mappedRegionName = await RegionNameFromHandleAsync(client, mapReply.RegionHandle, cancellationToken).ConfigureAwait(false);
             candidate = status with
             {
                 Online = true,
-                RegionName = RegionNameFromHandle(client, mapReply.RegionHandle),
+                RegionName = mappedRegionName,
                 RegionHandle = mapReply.RegionHandle,
                 Position = mapReply.Location,
                 IsFlying = null,
@@ -645,10 +651,13 @@ internal sealed class AgentLocator
         if (localPresenceHint == LocalPresenceHint.Present
             && (candidate == null || candidate.RegionHandle == null || candidate.RegionHandle == currentSim?.Handle))
         {
+            var currentRegionName = currentSim == null
+                ? null
+                : await RegionNameFromHandleAsync(client, currentSim.Handle, cancellationToken).ConfigureAwait(false);
             candidate = status with
             {
                 Online = true,
-                RegionName = currentSim == null ? null : RegionNameFromHandle(client, currentSim.Handle),
+                RegionName = currentRegionName,
                 RegionHandle = currentSim?.Handle,
                 Position = coarsePosition,
                 IsFlying = null,
@@ -666,9 +675,10 @@ internal sealed class AgentLocator
             if(candidate == null || ( candidate.RegionHandle == null || candidate.RegionHandle == currentSim?.Handle))
             {
                 LogDiag(correlationId, $"current-sim hit target={targetId} sim={(currentSim?.Name ?? "(unknown)")} localId={(foundAvatar?.LocalID.ToString(CultureInfo.InvariantCulture) ?? "n/a")} pos={(knownPosition.HasValue ? FormatVector(knownPosition.Value) : "n/a")}");
+                var foundRegionName = await RegionNameFromHandleAsync(client, foundAvatar?.RegionHandle ?? 0, cancellationToken).ConfigureAwait(false);
                 return new AgentMonitorStatus(
                     Online: true,
-                    RegionName: RegionNameFromHandle(client, foundAvatar?.RegionHandle ?? 0),
+                    RegionName: foundRegionName,
                     RegionHandle: foundAvatar?.RegionHandle,
                     Position: knownPosition,
                     IsFlying: foundAvatar == null ? null : ReadFlyingSignal(foundAvatar),
@@ -940,23 +950,68 @@ internal sealed class AgentLocator
         return heading;
     }
 
-    private static string? RegionNameFromHandle(GridClient client, ulong regionHandle)
+    private async Task<string?> RegionNameFromHandleAsync(GridClient client, ulong regionHandle, CancellationToken cancellationToken)
     {
-        
+        if (regionHandle == 0)
+        {
+            return null;
+        }
+
+        if (_regionNameByHandleCache.TryGetValue(regionHandle, out var cachedName)
+            && !string.IsNullOrWhiteSpace(cachedName))
+        {
+            return cachedName;
+        }
+
         var byName = client.Network.Simulators.FirstOrDefault(candidate =>
             !string.IsNullOrWhiteSpace(candidate.Name)
             && candidate.Handle == regionHandle);
-            
-        if(byName == null)
+
+        if (byName != null)
         {
-            return regionHandle > 0
-                ? regionHandle.ToString(CultureInfo.InvariantCulture)
-                : null;
+            var liveName = byName.Name.Trim();
+            _regionNameByHandleCache[regionHandle] = liveName;
+            _regionHandleLookupCooldownByHandle.TryRemove(regionHandle, out _);
+            return liveName;
         }
-        else
+
+        if (client.Grid.RegionsByHandleReadOnly.TryGetValue(regionHandle, out var mapped)
+            && !string.IsNullOrWhiteSpace(mapped.Name))
         {
-            return byName.Name;
+            var mappedName = mapped.Name.Trim();
+            _regionNameByHandleCache[regionHandle] = mappedName;
+            _regionHandleLookupCooldownByHandle.TryRemove(regionHandle, out _);
+            return mappedName;
         }
+
+        if (_regionHandleLookupCooldownByHandle.TryGetValue(regionHandle, out var retryAtUtc)
+            && retryAtUtc > DateTime.UtcNow)
+        {
+            return regionHandle.ToString(CultureInfo.InvariantCulture);
+        }
+
+        try
+        {
+            var lookup = await client.Grid.GetGridRegionAsync(regionHandle, GridLayerType.Objects, cancellationToken).ConfigureAwait(false);
+            if (lookup.HasValue && !string.IsNullOrWhiteSpace(lookup.Value.Name))
+            {
+                var lookedUpName = lookup.Value.Name.Trim();
+                _regionNameByHandleCache[regionHandle] = lookedUpName;
+                _regionHandleLookupCooldownByHandle.TryRemove(regionHandle, out _);
+                return lookedUpName;
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Grid lookup timeout inside LMV; keep fallback handle text and back off retries.
+        }
+        catch
+        {
+            // Best effort only; keep fallback handle text.
+        }
+
+        _regionHandleLookupCooldownByHandle[regionHandle] = DateTime.UtcNow + RegionHandleLookupRetryDelay;
+        return regionHandle.ToString(CultureInfo.InvariantCulture);
     }
 
 
