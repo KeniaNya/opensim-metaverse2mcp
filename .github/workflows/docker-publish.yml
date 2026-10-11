@@ -25,7 +25,9 @@ concurrency:
 
 env:
   IMAGE_NAME: bithatch/opensim-metaverse2mcp
-  USE_LIBREMETAVERSE_GIT: "false"
+  USE_LIBREMETAVERSE_GIT: "true"
+  LIBREMETAVERSE_GIT_REPO: https://github.com/opensim-stack/libremetaverse.git
+  LIBREMETAVERSE_GIT_REF: main
 
 jobs:
   build-and-push:
@@ -66,6 +68,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: |
             USE_LIBREMETAVERSE_GIT=${{ env.USE_LIBREMETAVERSE_GIT }}
+            LIBREMETAVERSE_GIT_REPO=${{ env.LIBREMETAVERSE_GIT_REPO }}
+            LIBREMETAVERSE_GIT_REF=${{ env.LIBREMETAVERSE_GIT_REF }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
