@@ -670,7 +670,7 @@ internal sealed class AgentLocator
         if (currentSim != null && TryFindAvatarByIdInSim(currentSim, targetId, expectedLocalId, localPresenceHint, out var foundAvatar))
         {
             // Branch: current-sim cache hit, dont take as authorative unless friend map matches region
-            var knownPosition = foundAvatar?.Position;
+            var knownPosition = ResolveAvatarWorldPosition(currentSim, foundAvatar, coarsePosition);
             
             if(candidate == null || ( candidate.RegionHandle == null || candidate.RegionHandle == currentSim?.Handle))
             {
@@ -816,6 +816,28 @@ internal sealed class AgentLocator
         }
 
         return sawGrounded ? false : null;
+    }
+
+    private static Vector3? ResolveAvatarWorldPosition(Simulator simulator, Avatar? avatar, Vector3? coarsePosition)
+    {
+        if (avatar == null)
+        {
+            return null;
+        }
+
+        if (avatar.ParentID == 0)
+        {
+            return avatar.Position;
+        }
+
+        // Sitting avatars report local offsets; convert to region coordinates when parent prim is known.
+        if (simulator.ObjectsPrimitives.TryGetValue(avatar.ParentID, out var parentPrim))
+        {
+            return parentPrim.Position + avatar.Position * parentPrim.Rotation;
+        }
+
+        // Fall back to coarse location when parent data has not streamed in yet.
+        return coarsePosition ?? avatar.Position;
     }
 
     private static bool TryFindAvatarByIdInSim(
