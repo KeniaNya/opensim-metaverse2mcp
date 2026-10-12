@@ -360,6 +360,9 @@ internal sealed partial class BotSession {
                 return BotToolResult.Fail("No current simulator available.");
             }
 
+            var preTeleportSimHandle = currentSim.Handle;
+            var preTeleportPosition = client.Self.SimPosition;
+
             bool ok;
             string destinationLabel;
             Vector3 target;
@@ -421,9 +424,9 @@ internal sealed partial class BotSession {
                 return BotToolResult.Fail(message);
             }
             
-            Console.WriteLine($"[teleport] Teleport succeeded to {destinationLabel} at {FormatVector(client.Self.SimPosition)}.");
+            var at = await ReadSettledTeleportPositionAsync(client, preTeleportSimHandle, preTeleportPosition, token).ConfigureAwait(false);
+            Console.WriteLine($"[teleport] Teleport succeeded to {destinationLabel} at {FormatVector(at)}.");
 
-            var at = client.Self.SimPosition;
             EmitRuntimeEvent(
                 "teleport",
                 "teleport.succeeded",
@@ -453,6 +456,8 @@ internal sealed partial class BotSession {
         var target = ClampLocalPosition(new Vector3(x, y, z));
         return await ExecuteLockedAsync(async (client, token) =>
         {
+            var preTeleportSimHandle = client.Network.CurrentSim?.Handle ?? 0UL;
+            var preTeleportPosition = client.Self.SimPosition;
             Console.WriteLine($"[teleport] Teleporting to region handle {handle} at {FormatVector(target)}.");
             var ok = await client.Self.TeleportAsync(handle, target, token).ConfigureAwait(false);
             if (!ok)
@@ -472,19 +477,20 @@ internal sealed partial class BotSession {
                 return BotToolResult.Fail(message);
             }
             
-            Console.WriteLine($"[teleport] Teleport succeeded to region handle {handle} at {FormatVector(client.Self.SimPosition)}.");
+            var settled = await ReadSettledTeleportPositionAsync(client, preTeleportSimHandle, preTeleportPosition, token).ConfigureAwait(false);
+            Console.WriteLine($"[teleport] Teleport succeeded to region handle {handle} at {FormatVector(settled)}.");
 
             EmitRuntimeEvent(
                 "teleport",
                 "teleport.succeeded",
                 "opensim",
-                $"Teleported to region handle {handle} at {FormatVector(client.Self.SimPosition)}.",
+                $"Teleported to region handle {handle} at {FormatVector(settled)}.",
                 new Dictionary<string, string?>
                 {
                     ["targetRegionHandle"] = handle.ToString(),
-                    ["position"] = FormatVector(client.Self.SimPosition)
+                    ["position"] = FormatVector(settled)
                 });
-            return BotToolResult.OkResult($"Teleported to region handle {handle} at {FormatVector(client.Self.SimPosition)}.");
+            return BotToolResult.OkResult($"Teleported to region handle {handle} at {FormatVector(settled)}.");
         }, cancellationToken).ConfigureAwait(false);
     }
 
@@ -523,6 +529,9 @@ internal sealed partial class BotSession {
             var destinationLabel = resolved.DisplayName;
             Console.WriteLine($"[teleport] Teleporting to landmark {destinationLabel} (asset {resolved.AssetId}).");
 
+            var preTeleportSimHandle = client.Network.CurrentSim?.Handle ?? 0UL;
+            var preTeleportPosition = client.Self.SimPosition;
+
             var ok = await client.Self.TeleportAsync(resolved.AssetId, token).ConfigureAwait(false);
             if (!ok)
             {
@@ -540,7 +549,7 @@ internal sealed partial class BotSession {
                 return BotToolResult.Fail(message);
             }
 
-            var at = client.Self.SimPosition;
+            var at = await ReadSettledTeleportPositionAsync(client, preTeleportSimHandle, preTeleportPosition, token).ConfigureAwait(false);
             EmitRuntimeEvent(
                 "teleport",
                 "teleport.succeeded",
@@ -2453,6 +2462,8 @@ internal sealed partial class BotSession {
     private const float DefaultLandingPointX = 128f;
     private const float DefaultLandingPointY = 128f;
     private const float DefaultLandingPointZ = 0f;
+    private static readonly TimeSpan TeleportPositionSettleTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan TeleportPositionPollInterval = TimeSpan.FromMilliseconds(100);
 
     private static string BuildTeleportFailureMessage(string? rawMessage, string destinationLabel)
     {
@@ -2463,6 +2474,31 @@ internal sealed partial class BotSession {
         }
 
         return message;
+    }
+
+    private static async Task<Vector3> ReadSettledTeleportPositionAsync(
+        GridClient client,
+        ulong preTeleportSimHandle,
+        Vector3 preTeleportPosition,
+        CancellationToken cancellationToken)
+    {
+        var startedAt = DateTime.UtcNow;
+        var latest = client.Self.SimPosition;
+        while (!cancellationToken.IsCancellationRequested
+            && DateTime.UtcNow - startedAt < TeleportPositionSettleTimeout)
+        {
+            var simHandle = client.Network.CurrentSim?.Handle ?? 0UL;
+            latest = client.Self.SimPosition;
+            var movedEnough = Vector3.Distance(latest, preTeleportPosition) >= 0.25f;
+            if (simHandle != preTeleportSimHandle || movedEnough)
+            {
+                return latest;
+            }
+
+            await Task.Delay(TeleportPositionPollInterval, cancellationToken).ConfigureAwait(false);
+        }
+
+        return latest;
     }
 
     private Vector3 ClampLocalPosition(Vector3 pos)
