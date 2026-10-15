@@ -1385,12 +1385,22 @@ internal sealed partial class BotSession
             await cof.GetCurrentOutfitLinksAsync(token).ConfigureAwait(false);
             await cof.RemoveFromOutfitAsync(wearable, token).ConfigureAwait(false);
 
+            var fullSet = await BuildCurrentWearableApplySetAsync(client, token).ConfigureAwait(false);
+            fullSet.RemoveAll(w => w.UUID == wearable.UUID);
+
+            var apply = await ApplyCompleteWearableSetAsync(client, fullSet, token).ConfigureAwait(false);
+            if (!apply.Ok)
+            {
+                return WearableDirectControlResult.FailResult(
+                    $"Requested remove wearable '{wearable.Name}' ({wearable.UUID}), but full wearable-set apply failed: {apply.Error}");
+            }
+
             return WearableDirectControlResult.OkResult(
                 wearable.WearableType.ToString(),
                 1,
                 1,
                 new[] { wearable.UUID.ToString() },
-                $"Requested remove wearable '{wearable.Name}' ({wearable.UUID}), type={wearable.WearableType} via COF.");
+                $"Requested remove wearable '{wearable.Name}' ({wearable.UUID}), type={wearable.WearableType} via COF + full-set apply ({apply.AppliedCount} wearables).");
         }, cancellationToken).ConfigureAwait(false);
     }
 
@@ -1416,6 +1426,17 @@ internal sealed partial class BotSession
 
             await cof.RemoveFromOutfitAsync(removeList, token).ConfigureAwait(false);
 
+            var removeIds = removeList.Select(i => i.UUID).ToHashSet();
+            var fullSet = await BuildCurrentWearableApplySetAsync(client, token).ConfigureAwait(false);
+            fullSet.RemoveAll(w => removeIds.Contains(w.UUID));
+
+            var apply = await ApplyCompleteWearableSetAsync(client, fullSet, token).ConfigureAwait(false);
+            if (!apply.Ok)
+            {
+                return WearableDirectControlResult.FailResult(
+                    $"Requested remove {removeList.Count} wearable layer(s) for type {parsedType}, but full wearable-set apply failed: {apply.Error}");
+            }
+
             var removedIds = removeList.Select(i => i.UUID.ToString()).ToList();
             var mode = removeAllLayers ? "all" : "single";
             return WearableDirectControlResult.OkResult(
@@ -1423,7 +1444,7 @@ internal sealed partial class BotSession
                 wornOfType.Count,
                 removeList.Count,
                 removedIds,
-                $"Requested remove {mode} wearable layer(s) for type {parsedType}. wornOfType={wornOfType.Count}, removeRequested={removeList.Count}.");
+                $"Requested remove {mode} wearable layer(s) for type {parsedType}. wornOfType={wornOfType.Count}, removeRequested={removeList.Count}, fullSetApplied={apply.AppliedCount}.");
         }, cancellationToken).ConfigureAwait(false);
     }
 
@@ -5553,26 +5574,101 @@ internal sealed partial class BotSession
                     $"Inventory item {resolved.UUID} ('{resolved.Name}') is not a wearable (assetType={resolved.AssetType}, inventoryType={resolved.InventoryType}).");
             }
 
-            // Apply directly through AppearanceManager to avoid COF/CAPS fetch instability
-            // being on the critical path for actually wearing the item.
-            client.Appearance.AddToOutfit(wearable, replaceExistingSlot);
-            await client.Appearance.RequestSetAppearance(forceRebake: true).ConfigureAwait(false);
+            var cof = GetSharedCurrentOutfitFolder(client);
+            await cof.GetCurrentOutfitLinksAsync(token).ConfigureAwait(false);
+            await cof.AddToOutfitAsync(wearable, replace: replaceExistingSlot, cancellationToken: token).ConfigureAwait(false);
 
-            // Best effort COF persistence so subsequent sessions still discover the link.
-            try
+            var fullSet = await BuildCurrentWearableApplySetAsync(client, token).ConfigureAwait(false);
+            if (replaceExistingSlot)
             {
-                var cof = GetSharedCurrentOutfitFolder(client);
-                await cof.GetCurrentOutfitLinksAsync(token).ConfigureAwait(false);
-                await cof.AddToOutfitAsync(wearable, replace: replaceExistingSlot, cancellationToken: token).ConfigureAwait(false);
+                fullSet.RemoveAll(w => w.WearableType == wearable.WearableType && w.UUID != wearable.UUID);
             }
-            catch (Exception ex)
+
+            if (fullSet.All(w => w.UUID != wearable.UUID))
             {
-                Console.WriteLine($"[appearance] COF sync for wearable '{wearable.Name}' failed after apply: {ex.Message}");
+                fullSet.Add(wearable);
+            }
+
+            var apply = await ApplyCompleteWearableSetAsync(client, fullSet, token).ConfigureAwait(false);
+            if (!apply.Ok)
+            {
+                return BotToolResult.Fail(
+                    $"Wear request for '{wearable.Name}' ({wearable.UUID}) could not apply full wearable set: {apply.Error}");
             }
 
             return BotToolResult.OkResult(
-                $"Wear request sent for wearable '{wearable.Name}' ({wearable.UUID}), type={wearable.WearableType}, replace={replaceExistingSlot}.");
+                $"Wear request sent for wearable '{wearable.Name}' ({wearable.UUID}), type={wearable.WearableType}, replace={replaceExistingSlot}, fullSetApplied={apply.AppliedCount}.");
         }, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<List<InventoryWearable>> BuildCurrentWearableApplySetAsync(
+        GridClient client,
+        CancellationToken cancellationToken)
+    {
+        var merged = new Dictionary<UUID, InventoryWearable>();
+
+        try
+        {
+            var cof = GetSharedCurrentOutfitFolder(client);
+            var links = await cof.GetCurrentOutfitLinksAsync(cancellationToken).ConfigureAwait(false);
+            foreach (var link in links)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var resolved = ResolveLinkedInventoryItem(client.Inventory.Store, link);
+                if (resolved is InventoryWearable wearable && wearable.UUID != UUID.Zero)
+                {
+                    merged[wearable.UUID] = wearable;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[appearance] COF wearable merge failed while building full apply set: {ex.Message}");
+        }
+
+        foreach (var snapshot in client.Appearance.GetWearables())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (snapshot.ItemID == UUID.Zero)
+            {
+                continue;
+            }
+
+            var item = await ResolveInventoryItemAsync(client, snapshot.ItemID, cancellationToken).ConfigureAwait(false);
+            if (item == null)
+            {
+                continue;
+            }
+
+            var resolved = ResolveLinkedInventoryItem(client.Inventory.Store, item);
+            if (resolved is InventoryWearable wearable && wearable.UUID != UUID.Zero)
+            {
+                merged[wearable.UUID] = wearable;
+            }
+        }
+
+        return merged.Values.ToList();
+    }
+
+    private static async Task<(bool Ok, int AppliedCount, string? Error)> ApplyCompleteWearableSetAsync(
+        GridClient client,
+        IReadOnlyCollection<InventoryWearable> wearables,
+        CancellationToken cancellationToken)
+    {
+        if (wearables.Count == 0)
+        {
+            return (false, 0, "No wearables were resolved for full-set apply.");
+        }
+
+        var wearTargets = wearables
+            .Cast<InventoryBase>()
+            .ToList();
+
+        await client.Appearance.WearOutfitAsync(wearTargets, true).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        await client.Appearance.RequestSetAppearance(forceRebake: true).ConfigureAwait(false);
+
+        return (true, wearables.Count, null);
     }
 
     private static Task<(
