@@ -4174,7 +4174,7 @@ internal sealed partial class BotSession
                 return AssetDownloadResult.FailResult($"Unable to download asset {assetUuid} as type {parsedAssetType}.");
             }
 
-            var payload = await BuildDownloadPayloadAsync(asset.AssetData, mode, fileNameHint, parsedAssetType, token).ConfigureAwait(false);
+            var payload = await BuildDownloadPayloadAsync(_options.ResolveWorkspaceDir(), asset.AssetData, mode, fileNameHint, parsedAssetType, token).ConfigureAwait(false);
             return AssetDownloadResult.OkResult(
                 payload.Base64,
                 payload.FilePath,
@@ -4209,7 +4209,7 @@ internal sealed partial class BotSession
                 return AssetDownloadResult.FailResult($"Unable to download texture {textureUuid}.");
             }
 
-            var payload = await BuildDownloadPayloadAsync(texture.AssetData, mode, fileNameHint, AssetType.Texture, token).ConfigureAwait(false);
+            var payload = await BuildDownloadPayloadAsync(_options.ResolveWorkspaceDir(),texture.AssetData, mode, fileNameHint, AssetType.Texture, token).ConfigureAwait(false);
             return AssetDownloadResult.OkResult(
                 payload.Base64,
                 payload.FilePath,
@@ -6277,6 +6277,7 @@ internal sealed partial class BotSession
     }
 
     private static async Task<(string? Base64, string? FilePath)> BuildDownloadPayloadAsync(
+        string WorkspaceDir,
         byte[] data,
         DownloadOutputMode mode,
         string? fileNameHint,
@@ -6306,7 +6307,15 @@ internal sealed partial class BotSession
                 safeName = $"asset-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
             }
 
-            filePath = Path.Combine(Path.GetTempPath(), safeName + ext);
+            if (string.IsNullOrWhiteSpace(WorkspaceDir))
+            {
+                filePath = Path.Combine(Path.GetTempPath(), safeName + ext);   
+            }
+            else
+            {
+                filePath = Path.Combine(WorkspaceDir, safeName + ext);   
+            }
+            
             await File.WriteAllBytesAsync(filePath, data, cancellationToken).ConfigureAwait(false);
         }
 

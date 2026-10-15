@@ -2865,7 +2865,7 @@ internal sealed class BotMcpTools
     [McpServerTool, Description("Download an asset by UUID and type. outputMode supports: both, base64, tempfile.")]
     public Task<AssetDownloadResult> AssetDownload(
         [Description("Asset UUID.")] string assetId,
-        [Description("Asset type name.")] string assetType,
+        [Description("Asset type name  (see get_asset_type for types).")] string assetType,
         [Description("Output mode: both, base64, tempfile.")] string outputMode,
         [Description("Optional filename hint when output includes tempfile.")] string? fileNameHint = null,
         CancellationToken cancellationToken = default)
@@ -2883,13 +2883,19 @@ internal sealed class BotMcpTools
         return _bot.TextureDownloadAsync(textureId, outputMode, fileNameHint, cancellationToken);
     }
 
+    [McpServerTool, Description("List all available asset-type names from the AssetType enum.")]
+    public string[] GetAssetTypes()
+    {
+        return Enum.GetNames<AssetType>();
+    }
+
     [McpServerTool, Description("Add a policy rule for incoming inventory offers. First matching rule decides accept/decline.")]
     public BotToolResult InventoryOfferPolicyRuleAdd(
         [Description("Rule name.")] string name,
         [Description("Action: accept or decline.")] string action,
         [Description("Optional exact sender avatar UUID match.")] string? senderAgentId = null,
         [Description("Optional sender name substring match (case-insensitive).") ] string? senderNameContains = null,
-        [Description("Optional exact asset type match.")] string? assetType = null,
+        [Description("Optional exact asset type match  (see get_asset_type for types).")] string? assetType = null,
         [Description("Optional match on task-origin offers (true/false).") ] bool? fromTask = null,
         [Description("Optional destination folder UUID override for accepted offers.")] string? destinationFolderId = null)
     {

@@ -64,6 +64,7 @@ internal sealed class AppOptions
     // {bot_uuid} templates so multi-bot deployments keep separate baselines.
     public bool AppearanceAutoRepairEnabled { get; set; } = true;
     public string AppearanceBaselineStateFile { get; set; } = "/workspace/state/appearance-autorepair-{bot_uuid}.json";
+    public string WorkspaceDir { get; set; } = "/workspace/bots/{bot_first}-{bot_last}";
     public string? OpencodeDefaultPromptPath { get; set; }
     public bool PromptProjectAgentsEnabled { get; set; } = true;
     public string PromptProjectAgentsFile { get; set; } = "AGENTS.md";
@@ -79,6 +80,14 @@ internal sealed class AppOptions
 
     public bool AllowIarImport { get; set; } = true;
     public bool AllowRlv { get; set; }
+    
+    
+
+    public string? ResolveWorkspaceDir() {
+        return Path.GetFullPath(WorkspaceDir.Replace("{bot_first}", BotFirstName, StringComparison.OrdinalIgnoreCase).
+            Replace("{bot_last}", BotLastName, StringComparison.OrdinalIgnoreCase)
+        );
+    }
     
     public IReadOnlyList<string> Validate()
     {

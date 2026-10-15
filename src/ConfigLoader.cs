@@ -64,6 +64,7 @@ internal static class ConfigLoader
             PromptNotecardRequireHandler = ParseBool(Env("PROMPT_NOTECARD_REQUIRE_HANDLER"), true),
             PromptMaxChars = ParseInt(Env("PROMPT_MAX_CHARS"), 16000),
             AppearanceAutoRepairEnabled = ParseBool(Env("APPEARANCE_AUTO_REPAIR_ENABLED"), true),
+            WorkspaceDir = Env("WORKSPACE_DIR") ?? "/workspace/bots/{bot_first}-{bot_last}",
             AppearanceBaselineStateFile = Env("APPEARANCE_BASELINE_STATE_FILE") ?? "/workspace/state/appearance-autorepair-{bot_uuid}.json",
             RequesterContextDebugLogging = ParseBool(Env("REQUESTER_CONTEXT_DEBUG_LOGGING"), false),
             ReceiveChatAllowedTypes = Env("LOCAL_CHAT_ALLOWED_TYPES") ?? "Normal,Whisper,Shout,StartTyping,StopTyping,Debug,OwnerSay,RegionSayTo,RegionSay",
@@ -119,6 +120,7 @@ internal static class ConfigLoader
             "  --spawner-port <port>          Spawner API port (env: SPAWNER_PORT, default: 8993)",
             "  --spawner-token <token>        Optional Spawner API bearer token (env: SPAWNER_TOKEN)",
             "  --group <group>                Optional Command & Control group for bot (env: OPENSIM_BOT_GROUP)",
+            "  --workspace <dir>              Optional workspace directory (env: WORKSPACE_DIR)",
             string.Empty,
             "Opencode chat bridge:",
             "  --opencode-enabled <bool>      Enable built-in opencode brain (env: OPENCODE_ENABLED, default: true)",
@@ -234,6 +236,9 @@ internal static class ConfigLoader
                     break;
                 case "--group":
                     options.BotGroup = RequireValue(args, ref i, arg);
+                    break;
+                case "--workspace":
+                    options.WorkspaceDir = RequireValue(args, ref i, arg);
                     break;
                 case "--start-location":
                     options.BotStartLocation = RequireValue(args, ref i, arg);
