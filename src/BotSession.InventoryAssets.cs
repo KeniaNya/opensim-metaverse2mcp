@@ -1743,14 +1743,16 @@ internal sealed partial class BotSession
             : new Dictionary<UUID, AttachmentPoint>();
 
         // Simulator object updates are often the most reliable source for what is currently attached.
+        // Only trust objects owned by this bot; nearby avatars expose the same AttachItemID NameValue key.
         var sim = client.Network.CurrentSim;
+        var botAgentId = client.Self.AgentID;
         if (sim != null)
         {
             foreach (var prim in sim.ObjectsPrimitives.Values)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                if (prim == null || prim.NameValues == null || !prim.NameValues.Any())
+                if (prim == null || prim.OwnerID != botAgentId || prim.NameValues == null || !prim.NameValues.Any())
                 {
                     continue;
                 }
@@ -6039,9 +6041,11 @@ internal sealed partial class BotSession
             return false;
         }
 
+        var botAgentId = client.Self.AgentID;
         foreach (var prim in sim.ObjectsPrimitives.Values)
         {
-            if (prim == null || prim.NameValues == null || !prim.NameValues.Any())
+            // Attachment fallback lookup must be owner-scoped so nearby avatars do not match by item UUID.
+            if (prim == null || prim.OwnerID != botAgentId || prim.NameValues == null || !prim.NameValues.Any())
             {
                 continue;
             }
