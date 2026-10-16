@@ -128,6 +128,39 @@ internal sealed partial class BotSession
         }, cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<BotToolResult> ScriptDialogTextInputAsync(string pendingDialogHandle, string text, CancellationToken cancellationToken)
+    {
+        var normalizedHandle = (pendingDialogHandle ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalizedHandle))
+        {
+            return BotToolResult.Fail("pendingDialogHandle is required.");
+        }
+
+        var submittedText = text ?? string.Empty;
+
+        return await ExecuteLockedAsync((client, _) =>
+        {
+            EnsureScriptDialogHookRegistered(client);
+
+            if (!_pendingScriptDialogsByHandle.TryGetValue(normalizedHandle, out var pendingDialog))
+            {
+                return Task.FromResult(BotToolResult.Fail($"No pending script dialog found for handle '{normalizedHandle}'."));
+            }
+
+            if (pendingDialog.ButtonLabels.Count == 0)
+            {
+                return Task.FromResult(BotToolResult.Fail($"Pending script dialog '{normalizedHandle}' has no button metadata to anchor a text reply."));
+            }
+
+            // Text-box dialogs accept free-form input in the button label field of the dialog reply packet.
+            client.Self.ReplyToScriptDialog(pendingDialog.Channel, 0, submittedText, pendingDialog.ObjectId);
+            _pendingScriptDialogsByHandle.TryRemove(normalizedHandle, out var _removedSubmitted);
+
+            return Task.FromResult(BotToolResult.OkResult(
+                $"Submitted script dialog text input for handle '{normalizedHandle}'."));
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task<DataToolResult> ListScriptAnimationPermissionRequestsAsync(string? pendingPermissionHandle, CancellationToken cancellationToken)
     {
         return await ExecuteLockedAsync((client, _token) =>

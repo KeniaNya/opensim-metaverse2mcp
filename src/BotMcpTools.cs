@@ -1182,6 +1182,15 @@ internal sealed class BotMcpTools
         return _bot.ScriptDialogChoiceAsync(pendingDialogHandle, buttonIndex, cancellationToken);
     }
 
+    [McpServerTool, Description("Submit free-form text for a pending scripted dialog that expects text input (for example llTextBox).")]
+    public Task<BotToolResult> ScriptDialogTextInput(
+        [Description("Pending dialog handle from ListScriptDialogs or script.dialog.received event.")] string pendingDialogHandle,
+        [Description("Text to submit back to the scripted object.")] string text,
+        CancellationToken cancellationToken = default)
+    {
+        return _bot.ScriptDialogTextInputAsync(pendingDialogHandle, text, cancellationToken);
+    }
+
     [McpServerTool, Description("List pending object animation permission requests captured during this session.")]
     public Task<DataToolResult> ListScriptAnimationPermissionRequests(
         [Description("Pending permission handle filter. Use 'all' (or empty) to list all pending requests.")] string? pendingPermissionHandle = null,
