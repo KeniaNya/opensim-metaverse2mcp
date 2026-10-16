@@ -3049,6 +3049,25 @@ internal sealed class BotMcpTools
         return _bot.AppearanceListWornAsync(includeAttachmentsAndWearables, includeCurrentOutfit, cancellationToken);
     }
 
+    [McpServerTool, Description("List known worn attachments for another avatar UUID from simulator avatar/object cache data.")]
+    public Task<AvatarAppearanceStateResult> AvatarAppearanceListWorn(
+        [Description("Target avatar UUID.")] string avatarId,
+        CancellationToken cancellationToken = default)
+    {
+        return _bot.AvatarAppearanceListWornAsync(avatarId, cancellationToken);
+    }
+
+    [McpServerTool, Description("Touch one attachment on another avatar using known simulator cache data. Provide objectId and/or attachmentPoint to target.")]
+    public Task<BotToolResult> AvatarAttachmentTouch(
+        [Description("Target avatar UUID.")] string avatarId,
+        [Description("Optional attachment point enum name (e.g. Chest, RightHand). Ignored when objectId is provided.")] string? attachmentPoint = null,
+        [Description("Optional attachment object UUID from AvatarAppearanceListWorn for precise targeting.")] string? objectId = null,
+        [Description("Optional settle delay in milliseconds after sending touch (0..5000).") ] int settleMs = 0,
+        CancellationToken cancellationToken = default)
+    {
+        return _bot.AvatarAttachmentTouchAsync(avatarId, attachmentPoint, objectId, settleMs, cancellationToken);
+    }
+
     [McpServerTool, Description("Resolve current outfit name/UUID from Current Outfit Folder (COF) link metadata.")]
     public Task<DataToolResult> AppearanceGetCurrentOutfit(CancellationToken cancellationToken = default)
     {

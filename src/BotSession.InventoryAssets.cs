@@ -4597,6 +4597,26 @@ internal sealed partial class BotSession
         }
     }
 
+    private async Task<AvatarAppearanceStateResult> ExecuteLockedAsync(
+        Func<GridClient, CancellationToken, Task<AvatarAppearanceStateResult>> action,
+        CancellationToken cancellationToken)
+    {
+        await _actionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var client = EnsureClient();
+            return await action(client, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            return AvatarAppearanceStateResult.FailResult(ex.Message);
+        }
+        finally
+        {
+            _actionGate.Release();
+        }
+    }
+
     private async Task<AssetTransferResult> ExecuteLockedAsync(
         Func<GridClient, CancellationToken, Task<AssetTransferResult>> action,
         CancellationToken cancellationToken)
@@ -6084,6 +6104,233 @@ internal sealed partial class BotSession
         return false;
     }
 
+    public async Task<AvatarAppearanceStateResult> AvatarAppearanceListWornAsync(
+        string avatarId,
+        CancellationToken cancellationToken)
+    {
+        if (!UUID.TryParse(avatarId, out var avatarUuid) || avatarUuid == UUID.Zero)
+        {
+            return AvatarAppearanceStateResult.FailResult("avatarId is not a valid non-zero UUID.");
+        }
+
+        return await ExecuteLockedAsync((client, token) =>
+        {
+            token.ThrowIfCancellationRequested();
+
+            if (!TryFindAvatarInKnownSims(client, avatarUuid, out var avatar, out var avatarSimulator))
+            {
+                return Task.FromResult(AvatarAppearanceStateResult.FailResult(
+                    $"Avatar {avatarUuid} is not present in known simulator avatar cache."));
+            }
+
+            var attachments = (avatar.Attachments ?? new List<Avatar.Attachment>())
+                .Where(attachment => attachment.AttachmentID != UUID.Zero)
+                .Select(attachment =>
+                {
+                    var localId = TryResolveAttachmentLocalId(client, attachment.AttachmentID, out var resolvedLocalId)
+                        ? resolvedLocalId
+                        : (uint?)null;
+                    return new AvatarAttachmentInfo(
+                        ((AttachmentPoint)attachment.AttachmentPoint).ToString(),
+                        attachment.AttachmentID.ToString(),
+                        localId);
+                })
+                .OrderBy(attachment => attachment.AttachmentPoint, StringComparer.Ordinal)
+                .ThenBy(attachment => attachment.ObjectId, StringComparer.Ordinal)
+                .ToList();
+
+            var regionName = avatarSimulator?.Name;
+            var avatarName = string.IsNullOrWhiteSpace(avatar.Name) ? null : avatar.Name;
+            var message = attachments.Count == 0
+                ? $"Avatar {avatarUuid} is present, but simulator cache currently reports no known attachments."
+                : $"Collected {attachments.Count} known attachment object(s) for avatar {avatarUuid} from simulator cache.";
+
+            return Task.FromResult(AvatarAppearanceStateResult.OkResult(
+                avatarUuid.ToString(),
+                avatarName,
+                regionName,
+                attachments,
+                message));
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<BotToolResult> AvatarAttachmentTouchAsync(
+        string avatarId,
+        string? attachmentPoint,
+        string? objectId,
+        int settleMs,
+        CancellationToken cancellationToken)
+    {
+        if (!UUID.TryParse(avatarId, out var avatarUuid) || avatarUuid == UUID.Zero)
+        {
+            return BotToolResult.Fail("avatarId is not a valid non-zero UUID.");
+        }
+
+        if (settleMs < 0 || settleMs > 5000)
+        {
+            return BotToolResult.Fail("settleMs must be between 0 and 5000.");
+        }
+
+        var attachmentPointFilter = string.IsNullOrWhiteSpace(attachmentPoint) ? null : attachmentPoint.Trim();
+        var hasObjectFilter = !string.IsNullOrWhiteSpace(objectId);
+
+        UUID objectUuid = UUID.Zero;
+        if (hasObjectFilter && (!UUID.TryParse(objectId!.Trim(), out objectUuid) || objectUuid == UUID.Zero))
+        {
+            return BotToolResult.Fail("objectId is not a valid non-zero UUID.");
+        }
+
+        var attachmentPointValue = AttachmentPoint.Default;
+        if (!hasObjectFilter && attachmentPointFilter == null)
+        {
+            return BotToolResult.Fail("Provide either objectId or attachmentPoint.");
+        }
+
+        if (!hasObjectFilter && attachmentPointFilter != null
+            && !Enum.TryParse<AttachmentPoint>(attachmentPointFilter, true, out attachmentPointValue))
+        {
+            return BotToolResult.Fail($"attachmentPoint '{attachmentPoint}' is not valid.");
+        }
+
+        return await ExecuteLockedAsync(async (client, token) =>
+        {
+            token.ThrowIfCancellationRequested();
+
+            var currentSim = client.Network.CurrentSim;
+            if (currentSim == null)
+            {
+                return BotToolResult.Fail("No current simulator available.");
+            }
+
+            if (!TryFindAvatarInKnownSims(client, avatarUuid, out var avatar, out var avatarSimulator))
+            {
+                return BotToolResult.Fail($"Avatar {avatarUuid} is not present in known simulator avatar cache.");
+            }
+
+            if (avatarSimulator == null || avatarSimulator.Handle != currentSim.Handle)
+            {
+                var seenRegion = string.IsNullOrWhiteSpace(avatarSimulator?.Name) ? "another simulator" : $"region '{avatarSimulator!.Name}'";
+                return BotToolResult.Fail($"Avatar {avatarUuid} is currently known in {seenRegion}. Move bot to the same region before touching attachments.");
+            }
+
+            var attachments = (avatar.Attachments ?? new List<Avatar.Attachment>())
+                .Where(attachment => attachment.AttachmentID != UUID.Zero)
+                .ToList();
+
+            if (attachments.Count == 0)
+            {
+                return BotToolResult.Fail($"Avatar {avatarUuid} has no known attachments in simulator cache.");
+            }
+
+            IEnumerable<Avatar.Attachment> candidates = attachments;
+            if (hasObjectFilter)
+            {
+                candidates = candidates.Where(attachment => attachment.AttachmentID == objectUuid);
+            }
+            else
+            {
+                var requestedPointByte = (byte)attachmentPointValue;
+                candidates = candidates.Where(attachment => attachment.AttachmentPoint == requestedPointByte);
+            }
+
+            var matched = candidates
+                .OrderBy(attachment => attachment.AttachmentID.ToString(), StringComparer.Ordinal)
+                .ToList();
+
+            if (matched.Count == 0)
+            {
+                if (hasObjectFilter)
+                {
+                    return BotToolResult.Fail($"Attachment object {objectUuid} is not known for avatar {avatarUuid} in current simulator cache.");
+                }
+
+                return BotToolResult.Fail($"No known attachment matches point '{attachmentPointValue}' for avatar {avatarUuid}.");
+            }
+
+            var selected = matched[0];
+            if (!TryResolveAttachmentLocalIdInSimulator(currentSim, selected.AttachmentID, out var localId))
+            {
+                return BotToolResult.Fail($"Attachment object {selected.AttachmentID} is known for avatar {avatarUuid}, but no local ID is available in current simulator cache.");
+            }
+
+            client.Self.Touch(localId);
+            if (settleMs > 0)
+            {
+                await Task.Delay(settleMs, token).ConfigureAwait(false);
+            }
+
+            var selectedPoint = ((AttachmentPoint)selected.AttachmentPoint).ToString();
+            var settleSuffix = settleMs > 0 ? $"; waited {settleMs}ms for settle" : string.Empty;
+            var disambiguation = matched.Count > 1
+                ? $" Matched {matched.Count} attachments; touched first by object UUID ordering. Provide objectId for strict targeting."
+                : string.Empty;
+
+            return BotToolResult.OkResult(
+                $"Touch request sent for avatar {avatarUuid} attachment {selected.AttachmentID} (point={selectedPoint}, localId={localId}){settleSuffix}.{disambiguation}");
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static bool TryFindAvatarInKnownSims(
+        GridClient client,
+        UUID avatarId,
+        out Avatar avatar,
+        out Simulator? avatarSimulator)
+    {
+        foreach (var simulator in client.Network.Simulators)
+        {
+            var match = simulator.ObjectsAvatars.Values.FirstOrDefault(candidate => candidate != null && candidate.ID == avatarId);
+            if (match != null)
+            {
+                avatar = match;
+                avatarSimulator = simulator;
+                return true;
+            }
+        }
+
+        avatar = null!;
+        avatarSimulator = null;
+        return false;
+    }
+
+    private static bool TryResolveAttachmentLocalId(
+        GridClient client,
+        UUID attachmentObjectId,
+        out uint localId)
+    {
+        foreach (var simulator in client.Network.Simulators)
+        {
+            foreach (var prim in simulator.ObjectsPrimitives.Values)
+            {
+                if (prim != null && prim.ID == attachmentObjectId)
+                {
+                    localId = prim.LocalID;
+                    return true;
+                }
+            }
+        }
+
+        localId = 0;
+        return false;
+    }
+
+    private static bool TryResolveAttachmentLocalIdInSimulator(
+        Simulator simulator,
+        UUID attachmentObjectId,
+        out uint localId)
+    {
+        foreach (var prim in simulator.ObjectsPrimitives.Values)
+        {
+            if (prim != null && prim.ID == attachmentObjectId)
+            {
+                localId = prim.LocalID;
+                return true;
+            }
+        }
+
+        localId = 0;
+        return false;
+    }
+
     private static AttachmentTransformResult BuildAttachmentTransformResult(
         UUID itemId,
         UUID objectId,
@@ -6695,6 +6942,28 @@ internal sealed record InventoryOfferHistoryResult(bool Ok, string Message, IRea
 internal sealed record WearableInfo(string ItemId, string AssetId, string WearableType, string AssetType, string Source);
 
 internal sealed record AttachmentInfo(string ItemId, string AttachmentPoint, string? ObjectId, uint? ObjectLocalId);
+
+internal sealed record AvatarAttachmentInfo(string AttachmentPoint, string ObjectId, uint? ObjectLocalId);
+
+internal sealed record AvatarAppearanceStateResult(
+    bool Ok,
+    string Message,
+    string? AvatarId,
+    string? AvatarName,
+    string? RegionName,
+    IReadOnlyList<AvatarAttachmentInfo> Attachments)
+{
+    public static AvatarAppearanceStateResult OkResult(
+        string avatarId,
+        string? avatarName,
+        string? regionName,
+        IReadOnlyList<AvatarAttachmentInfo> attachments,
+        string message)
+        => new(true, message, avatarId, avatarName, regionName, attachments);
+
+    public static AvatarAppearanceStateResult FailResult(string message)
+        => new(false, message, null, null, null, Array.Empty<AvatarAttachmentInfo>());
+}
 
 internal sealed record WearAttachmentIniConfig(
     AttachmentPoint? AttachPoint,

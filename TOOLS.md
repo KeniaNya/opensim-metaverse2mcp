@@ -124,6 +124,8 @@ The server publishes tools including:
 - `ListObjectMonitors`
 - `CloseObjectMonitor`
 - `AppearanceListWorn`
+- `AvatarAppearanceListWorn`
+- `AvatarAttachmentTouch`
 - `AppearanceGetCurrentOutfit`
 - `AppearanceWearFolder`
 - `ListOutfits`
@@ -183,6 +185,7 @@ Social/friends tools:
 - `TeleportOfferRespond`
 - `ListScriptDialogs`
 - `ScriptDialogChoice`
+- `ScriptDialogTextInput`
 - `ListScriptAnimationPermissionRequests`
 - `ScriptAnimationPermissionRespond`
 - `GroupInviteRespond`
@@ -193,6 +196,7 @@ Social/friends notes:
 - Accepting a friendship offer from a configured handler auto-enables all three rights by default.
 - Incoming group invitations emit runtime event `groups.invite.received` on channel `friends`; use `groupId` (+ optional `sessionId`) with `GroupInviteRespond` to accept/decline.
 - Incoming scripted object dialogs emit runtime event `script.dialog.received` on channel `general`; use `pendingDialogHandle` with `ScriptDialogChoice` (`buttonIndex=-1` cancels without responding).
+- Scripted text-box prompts (for example `llTextBox`) can be answered with `ScriptDialogTextInput(pendingDialogHandle, text)` using the same pending dialog handle.
 - Incoming object animation permission prompts emit runtime event `script.permission.animation.requested` on channel `general`; use `pendingPermissionHandle` with `ScriptAnimationPermissionRespond`.
 
 Chat notes:
@@ -356,6 +360,9 @@ Appearance and script notes:
 - `ListOutfits` returns folder names/UUIDs found under the My Outfits root (with fallback to a root folder named `My Outfits`/`Outfits`).
 - `AppearanceWearOutfit` resolves an outfit by name under My Outfits and updates only the COF outfit-folder link (it does not directly wear attachments/wearables).
 - `AppearanceAttachItem` can use an explicit `attachmentPoint`, or falls back to the item's default point when available.
+- `AvatarAppearanceListWorn` reports another avatar's currently known attachment object UUIDs from simulator cache and includes local IDs when resolvable.
+- `AvatarAttachmentTouch` is a convenience wrapper that resolves a target attachment (by `objectId` or `attachmentPoint`) and performs `client.Self.Touch(localId)` in one call.
+- `AvatarAttachmentTouch` requires the target avatar/object to be known in the bot's current simulator cache; when multiple attachments match a point, pass `objectId` for strict targeting.
 - `AppearanceVisualParamsList` exposes slider metadata (ranges/default/group/wearable) plus current values.
 - `AppearanceVisualParamSet` edits one group-0 slider parameter and requests a rebake/update.
 - `AppearanceBakeDiagnostics` returns baked texture slot IDs and optional cache-probe latency diagnostics.
@@ -426,6 +433,21 @@ Alternative import example when you only have a source file/URL and want the ser
 
 ```text
 AssetUploadInventory(source="./go-away.lsl", assetType="auto", inventoryType="auto", name="Go Away", description="Touch says Go away!", folderId="")
+```
+
+### 2b) Touch another avatar attachment and answer scripted text input
+
+1. Discover known attachments on the target avatar with `AvatarAppearanceListWorn`.
+2. Touch one attachment directly with `AvatarAttachmentTouch` (prefer `objectId` for exact targeting).
+3. If the attachment opens a dialog textbox, submit text with `ScriptDialogTextInput`.
+
+Suggested tool flow:
+
+```text
+AvatarAppearanceListWorn(avatarId="<target-avatar-uuid>")
+AvatarAttachmentTouch(avatarId="<target-avatar-uuid>", objectId="<attachment-object-uuid>", settleMs=250)
+ListScriptDialogs(pendingDialogHandle="all")
+ScriptDialogTextInput(pendingDialogHandle="<dialog-handle>", text="menu option text")
 ```
 
 ### 3) Manage inventory-offer policy rules with persistence
