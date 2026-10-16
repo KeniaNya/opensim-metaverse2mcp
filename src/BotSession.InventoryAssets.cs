@@ -77,7 +77,7 @@ internal sealed partial class BotSession
                     token)
                 .ConfigureAwait(false);
 
-            var staleAttachmentMappings = 0;
+            var unresolvedLiveAttachmentObjects = 0;
             var attachments = (await CollectAttachmentPointMappingsAsync(
                         client,
                         token,
@@ -88,8 +88,12 @@ internal sealed partial class BotSession
                 {
                     if (!TryFindAttachedObjectForInventoryItem(client, a.Key, out var objectId, out var localId))
                     {
-                        staleAttachmentMappings++;
-                        return null;
+                        unresolvedLiveAttachmentObjects++;
+                        return new AttachmentInfo(
+                            a.Key.ToString(),
+                            a.Value.ToString(),
+                            null,
+                            null);
                     }
 
                     return new AttachmentInfo(
@@ -98,8 +102,6 @@ internal sealed partial class BotSession
                         objectId.ToString(),
                         localId);
                 })
-                .Where(a => a != null)
-                .Select(a => a!)
                 .OrderBy(a => a.AttachmentPoint, StringComparer.Ordinal)
                 .ThenBy(a => a.ItemId, StringComparer.Ordinal)
                 .ToList();
@@ -109,9 +111,9 @@ internal sealed partial class BotSession
                 : includeAttachmentsAndWearables
                     ? "runtime-only mode"
                     : "COF-only mode";
-            var message = staleAttachmentMappings > 0
-                ? $"Collected currently worn wearables and live attachments in {mode} (ignored {staleAttachmentMappings} stale attachment mapping(s))."
-                : $"Collected currently worn wearables and live attachments in {mode}.";
+            var message = unresolvedLiveAttachmentObjects > 0
+                ? $"Collected currently worn wearables and attachments in {mode} ({unresolvedLiveAttachmentObjects} attachment(s) had no live object snapshot this session)."
+                : $"Collected currently worn wearables and attachments in {mode}.";
             return AppearanceStateResult.OkResult(wearables, attachments, message);
         }, cancellationToken).ConfigureAwait(false);
     }
@@ -1785,10 +1787,22 @@ internal sealed partial class BotSession
                 switch (resolved)
                 {
                     case InventoryAttachment attachment:
-                        merged[attachment.ResolvedItemID] = attachment.AttachmentPoint;
+                        // COF link metadata can be Default; do not downgrade a point already confirmed by runtime/sim data.
+                        if (!merged.TryGetValue(attachment.ResolvedItemID, out var existingAttachmentPoint)
+                            || existingAttachmentPoint == AttachmentPoint.Default
+                            || attachment.AttachmentPoint != AttachmentPoint.Default)
+                        {
+                            merged[attachment.ResolvedItemID] = attachment.AttachmentPoint;
+                        }
                         break;
                     case InventoryObject obj:
-                        merged[obj.ResolvedItemID] = obj.AttachPoint;
+                        // Same protection for object links resolved from COF.
+                        if (!merged.TryGetValue(obj.ResolvedItemID, out var existingObjectPoint)
+                            || existingObjectPoint == AttachmentPoint.Default
+                            || obj.AttachPoint != AttachmentPoint.Default)
+                        {
+                            merged[obj.ResolvedItemID] = obj.AttachPoint;
+                        }
                         break;
                 }
             }
