@@ -125,6 +125,7 @@ The server publishes tools including:
 - `CloseObjectMonitor`
 - `AppearanceListWorn`
 - `AvatarAppearanceListWorn`
+- `AvatarCacheList`
 - `AvatarAttachmentTouch`
 - `AppearanceGetCurrentOutfit`
 - `AppearanceWearFolder`
@@ -361,6 +362,7 @@ Appearance and script notes:
 - `AppearanceWearOutfit` resolves an outfit by name under My Outfits and updates only the COF outfit-folder link (it does not directly wear attachments/wearables).
 - `AppearanceAttachItem` can use an explicit `attachmentPoint`, or falls back to the item's default point when available.
 - `AvatarAppearanceListWorn` reports another avatar's currently known attachment object UUIDs from simulator cache and includes local IDs when resolvable.
+- `AvatarCacheList` is a diagnostics tool that dumps all currently cached `ObjectAvatars` entries across known simulators (including attachment snapshots per entry).
 - `AvatarAttachmentTouch` is a convenience wrapper that resolves a target attachment (by `objectId` or `attachmentPoint`) and performs `client.Self.Touch(localId)` in one call.
 - `AvatarAttachmentTouch` requires the target avatar/object to be known in the bot's current simulator cache; when multiple attachments match a point, pass `objectId` for strict targeting.
 - `AppearanceVisualParamsList` exposes slider metadata (ranges/default/group/wearable) plus current values.
@@ -438,13 +440,15 @@ AssetUploadInventory(source="./go-away.lsl", assetType="auto", inventoryType="au
 ### 2b) Touch another avatar attachment and answer scripted text input
 
 1. Discover known attachments on the target avatar with `AvatarAppearanceListWorn`.
-2. Touch one attachment directly with `AvatarAttachmentTouch` (prefer `objectId` for exact targeting).
-3. If the attachment opens a dialog textbox, submit text with `ScriptDialogTextInput`.
+2. If attachment data is missing, run `AvatarCacheList` to verify whether the avatar is present in cache at all.
+3. Touch one attachment directly with `AvatarAttachmentTouch` (prefer `objectId` for exact targeting).
+4. If the attachment opens a dialog textbox, submit text with `ScriptDialogTextInput`.
 
 Suggested tool flow:
 
 ```text
 AvatarAppearanceListWorn(avatarId="<target-avatar-uuid>")
+AvatarCacheList()
 AvatarAttachmentTouch(avatarId="<target-avatar-uuid>", objectId="<attachment-object-uuid>", settleMs=250)
 ListScriptDialogs(pendingDialogHandle="all")
 ScriptDialogTextInput(pendingDialogHandle="<dialog-handle>", text="menu option text")

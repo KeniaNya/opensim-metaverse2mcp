@@ -4617,6 +4617,26 @@ internal sealed partial class BotSession
         }
     }
 
+    private async Task<AvatarCacheListResult> ExecuteLockedAsync(
+        Func<GridClient, CancellationToken, Task<AvatarCacheListResult>> action,
+        CancellationToken cancellationToken)
+    {
+        await _actionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var client = EnsureClient();
+            return await action(client, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            return AvatarCacheListResult.FailResult(ex.Message);
+        }
+        finally
+        {
+            _actionGate.Release();
+        }
+    }
+
     private async Task<AssetTransferResult> ExecuteLockedAsync(
         Func<GridClient, CancellationToken, Task<AssetTransferResult>> action,
         CancellationToken cancellationToken)
@@ -6154,6 +6174,51 @@ internal sealed partial class BotSession
         }, cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<AvatarCacheListResult> AvatarCacheListAsync(CancellationToken cancellationToken)
+    {
+        return await ExecuteLockedAsync((client, token) =>
+        {
+            token.ThrowIfCancellationRequested();
+
+            var entries = client.Network.Simulators
+                .SelectMany(simulator => simulator.ObjectsAvatars.Values
+                    .Where(avatar => avatar != null)
+                    .Select(avatar =>
+                    {
+                        var attachments = (avatar.Attachments ?? new List<Avatar.Attachment>())
+                            .Where(attachment => attachment.AttachmentID != UUID.Zero)
+                            .Select(attachment => new AvatarCacheAttachmentInfo(
+                                attachment.AttachmentID.ToString(),
+                                attachment.AttachmentPoint,
+                                ((AttachmentPoint)attachment.AttachmentPoint).ToString()))
+                            .OrderBy(attachment => attachment.AttachmentPointRaw)
+                            .ThenBy(attachment => attachment.ObjectId, StringComparer.Ordinal)
+                            .ToList();
+
+                        return new AvatarCacheEntryInfo(
+                            avatar.ID.ToString(),
+                            string.IsNullOrWhiteSpace(avatar.Name) ? null : avatar.Name,
+                            simulator.Name,
+                            simulator.Handle,
+                            avatar.LocalID,
+                            attachments.Count,
+                            attachments);
+                    }))
+                .OrderBy(entry => entry.RegionName, StringComparer.Ordinal)
+                .ThenBy(entry => entry.LocalId)
+                .ThenBy(entry => entry.AvatarId, StringComparer.Ordinal)
+                .ToList();
+
+            var uniqueAvatarCount = entries
+                .Select(entry => entry.AvatarId)
+                .Distinct(StringComparer.Ordinal)
+                .Count();
+
+            var message = $"Collected {entries.Count} avatar cache entr{(entries.Count == 1 ? "y" : "ies")} across {client.Network.Simulators.Count} simulator(s); unique avatars: {uniqueAvatarCount}.";
+            return Task.FromResult(AvatarCacheListResult.OkResult(entries, message));
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task<BotToolResult> AvatarAttachmentTouchAsync(
         string avatarId,
         string? attachmentPoint,
@@ -6713,7 +6778,9 @@ internal sealed partial class BotSession
         Base64,
         TempFile,
         Both
-    }    private async Task<WearableDirectControlResult> ExecuteLockedAsync(
+    }    
+    
+    private async Task<WearableDirectControlResult> ExecuteLockedAsync(
         Func<GridClient, CancellationToken, Task<WearableDirectControlResult>> action,
         CancellationToken cancellationToken)
     {
@@ -6944,6 +7011,30 @@ internal sealed record WearableInfo(string ItemId, string AssetId, string Wearab
 internal sealed record AttachmentInfo(string ItemId, string AttachmentPoint, string? ObjectId, uint? ObjectLocalId);
 
 internal sealed record AvatarAttachmentInfo(string AttachmentPoint, string ObjectId, uint? ObjectLocalId);
+
+internal sealed record AvatarCacheAttachmentInfo(string ObjectId, byte AttachmentPointRaw, string AttachmentPoint);
+
+internal sealed record AvatarCacheEntryInfo(
+    string AvatarId,
+    string? AvatarName,
+    string RegionName,
+    ulong RegionHandle,
+    uint LocalId,
+    int AttachmentCount,
+    IReadOnlyList<AvatarCacheAttachmentInfo> Attachments);
+
+internal sealed record AvatarCacheListResult(
+    bool Ok,
+    string Message,
+    int EntryCount,
+    IReadOnlyList<AvatarCacheEntryInfo> Avatars)
+{
+    public static AvatarCacheListResult OkResult(IReadOnlyList<AvatarCacheEntryInfo> avatars, string message)
+        => new(true, message, avatars.Count, avatars);
+
+    public static AvatarCacheListResult FailResult(string message)
+        => new(false, message, 0, Array.Empty<AvatarCacheEntryInfo>());
+}
 
 internal sealed record AvatarAppearanceStateResult(
     bool Ok,

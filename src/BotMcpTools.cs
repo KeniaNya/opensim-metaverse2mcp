@@ -3057,6 +3057,12 @@ internal sealed class BotMcpTools
         return _bot.AvatarAppearanceListWornAsync(avatarId, cancellationToken);
     }
 
+    [McpServerTool, Description("Diagnostic: list all avatar entries currently present in simulator ObjectAvatars caches.")]
+    public Task<AvatarCacheListResult> AvatarCacheList(CancellationToken cancellationToken = default)
+    {
+        return _bot.AvatarCacheListAsync(cancellationToken);
+    }
+
     [McpServerTool, Description("Touch one attachment on another avatar using known simulator cache data. Provide objectId and/or attachmentPoint to target.")]
     public Task<BotToolResult> AvatarAttachmentTouch(
         [Description("Target avatar UUID.")] string avatarId,
