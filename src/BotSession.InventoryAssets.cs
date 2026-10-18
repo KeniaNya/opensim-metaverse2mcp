@@ -6143,16 +6143,17 @@ internal sealed partial class BotSession
                     $"Avatar {avatarUuid} is not present in known simulator avatar cache."));
             }
 
-            var attachments = (avatar.Attachments ?? new List<Avatar.Attachment>())
-                .Where(attachment => attachment.AttachmentID != UUID.Zero)
+            var knownAttachments = GetKnownAvatarAttachments(avatar, avatarSimulator);
+
+            var attachments = knownAttachments
                 .Select(attachment =>
                 {
-                    var localId = TryResolveAttachmentLocalId(client, attachment.AttachmentID, out var resolvedLocalId)
+                    var localId = TryResolveAttachmentLocalId(client, attachment.AttachmentId, out var resolvedLocalId)
                         ? resolvedLocalId
                         : (uint?)null;
                     return new AvatarAttachmentInfo(
                         ((AttachmentPoint)attachment.AttachmentPoint).ToString(),
-                        attachment.AttachmentID.ToString(),
+                        attachment.AttachmentId.ToString(),
                         localId);
                 })
                 .OrderBy(attachment => attachment.AttachmentPoint, StringComparer.Ordinal)
@@ -6185,10 +6186,9 @@ internal sealed partial class BotSession
                     .Where(avatar => avatar != null)
                     .Select(avatar =>
                     {
-                        var attachments = (avatar.Attachments ?? new List<Avatar.Attachment>())
-                            .Where(attachment => attachment.AttachmentID != UUID.Zero)
+                        var attachments = GetKnownAvatarAttachments(avatar, simulator)
                             .Select(attachment => new AvatarCacheAttachmentInfo(
-                                attachment.AttachmentID.ToString(),
+                                attachment.AttachmentId.ToString(),
                                 attachment.AttachmentPoint,
                                 ((AttachmentPoint)attachment.AttachmentPoint).ToString()))
                             .OrderBy(attachment => attachment.AttachmentPointRaw)
@@ -6278,19 +6278,17 @@ internal sealed partial class BotSession
                 return BotToolResult.Fail($"Avatar {avatarUuid} is currently known in {seenRegion}. Move bot to the same region before touching attachments.");
             }
 
-            var attachments = (avatar.Attachments ?? new List<Avatar.Attachment>())
-                .Where(attachment => attachment.AttachmentID != UUID.Zero)
-                .ToList();
+            var attachments = GetKnownAvatarAttachments(avatar, avatarSimulator);
 
             if (attachments.Count == 0)
             {
                 return BotToolResult.Fail($"Avatar {avatarUuid} has no known attachments in simulator cache.");
             }
 
-            IEnumerable<Avatar.Attachment> candidates = attachments;
+            IEnumerable<(UUID AttachmentId, byte AttachmentPoint)> candidates = attachments;
             if (hasObjectFilter)
             {
-                candidates = candidates.Where(attachment => attachment.AttachmentID == objectUuid);
+                candidates = candidates.Where(attachment => attachment.AttachmentId == objectUuid);
             }
             else
             {
@@ -6299,7 +6297,7 @@ internal sealed partial class BotSession
             }
 
             var matched = candidates
-                .OrderBy(attachment => attachment.AttachmentID.ToString(), StringComparer.Ordinal)
+                .OrderBy(attachment => attachment.AttachmentId.ToString(), StringComparer.Ordinal)
                 .ToList();
 
             if (matched.Count == 0)
@@ -6313,9 +6311,9 @@ internal sealed partial class BotSession
             }
 
             var selected = matched[0];
-            if (!TryResolveAttachmentLocalIdInSimulator(currentSim, selected.AttachmentID, out var localId))
+            if (!TryResolveAttachmentLocalIdInSimulator(currentSim, selected.AttachmentId, out var localId))
             {
-                return BotToolResult.Fail($"Attachment object {selected.AttachmentID} is known for avatar {avatarUuid}, but no local ID is available in current simulator cache.");
+                return BotToolResult.Fail($"Attachment object {selected.AttachmentId} is known for avatar {avatarUuid}, but no local ID is available in current simulator cache.");
             }
 
             client.Self.Touch(localId);
@@ -6331,8 +6329,45 @@ internal sealed partial class BotSession
                 : string.Empty;
 
             return BotToolResult.OkResult(
-                $"Touch request sent for avatar {avatarUuid} attachment {selected.AttachmentID} (point={selectedPoint}, localId={localId}){settleSuffix}.{disambiguation}");
+                $"Touch request sent for avatar {avatarUuid} attachment {selected.AttachmentId} (point={selectedPoint}, localId={localId}){settleSuffix}.{disambiguation}");
         }, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static List<(UUID AttachmentId, byte AttachmentPoint)> GetKnownAvatarAttachments(Avatar avatar, Simulator? avatarSimulator)
+    {
+        var results = new List<(UUID AttachmentId, byte AttachmentPoint)>();
+        var seen = new HashSet<UUID>();
+
+        foreach (var attachment in avatar.Attachments ?? new List<Avatar.Attachment>())
+        {
+            if (attachment.AttachmentID == UUID.Zero)
+            {
+                continue;
+            }
+
+            if (seen.Add(attachment.AttachmentID))
+            {
+                results.Add((attachment.AttachmentID, attachment.AttachmentPoint));
+            }
+        }
+
+        if (avatarSimulator != null && avatar.LocalID != 0)
+        {
+            foreach (var prim in avatarSimulator.ObjectsPrimitives.Values)
+            {
+                if (prim == null || prim.ID == UUID.Zero || prim.ParentID != avatar.LocalID)
+                {
+                    continue;
+                }
+
+                if (seen.Add(prim.ID))
+                {
+                    results.Add((prim.ID, (byte)prim.PrimData.AttachmentPoint));
+                }
+            }
+        }
+
+        return results;
     }
 
     private static bool TryFindAvatarInKnownSims(

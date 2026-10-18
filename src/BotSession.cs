@@ -330,6 +330,7 @@ internal sealed partial class BotSession : IDisposable
             LibreMetaverse.Settings.LogLevel = Microsoft.Extensions.Logging.LogLevel.Debug;
             client.Settings.Logging.LogResends = false;
             client.Settings.World.StoreLandPatches = true;
+            client.Settings.World.TrackAvatars = true;
             client.Settings.World.AlwaysDecodeObjects = true;
             client.Settings.World.AlwaysRequestObjects = true;
             client.Settings.Agent.SendUpdates = true;
