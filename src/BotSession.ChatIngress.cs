@@ -38,6 +38,12 @@ internal sealed partial class BotSession
             return;
         }
 
+        if (e.IM.Dialog == InstantMessageDialog.MessageFromObject
+            && TryProcessSignalsInstantIngress(client, e.IM.FromAgentID, e.IM.FromAgentName, e.IM.Position, text))
+        {
+            return;
+        }
+
         if (e.IM.Dialog == InstantMessageDialog.MessageFromObject)
         {
             if (e.IM.Dialog == InstantMessageDialog.MessageFromObject
@@ -525,6 +531,8 @@ internal sealed partial class BotSession
         {
             return;
         }
+
+        TryProcessSignalsIngress(client, e, text);
 
         if (!_receiveChatAllowedTypes.Contains(e.Type))
         {

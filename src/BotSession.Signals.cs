@@ -3,13 +3,14 @@ using System.Globalization;
 using System.Net.Http;
 using System.Text.Json;
 using LibreMetaverse;
-using LibreMetaverse.Packets;
 
 namespace Opensim.Metaverse2Mcp;
 
 internal sealed partial class BotSession
 {
     private const int SignalsDiscoveryChannel = -44448888;
+    private const string SignalsProtocolVersion = "1";
+    private const string SignalsIahPrefix = "_SIGNALS_:";
     private static readonly TimeSpan SignalsCacheMaxAge = TimeSpan.FromSeconds(300);
     private static readonly TimeSpan SignalsCachePruneInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan SignalsChatDescriptionTimeout = TimeSpan.FromSeconds(5);
@@ -18,7 +19,11 @@ internal sealed partial class BotSession
     private readonly ConcurrentDictionary<UUID, SignalDiscoveryCacheEntry> _signalsDiscoveryBySender = new();
     private readonly ConcurrentDictionary<UUID, PendingSignalsDescriptionRequest> _pendingSignalsDescriptionBySender = new();
     private readonly HttpClient _signalsHttpClient = new();
+    private readonly object _signalsDiscoveryScheduleLock = new();
+    private readonly Random _signalsRandom = new();
     private int _signalsMaintenanceLoopStarted;
+    private DateTimeOffset _signalsNextDiscoveryBroadcastUtc = DateTimeOffset.MinValue;
+    private ulong _signalsDiscoveryRegionHandle;
 
     private void StartSignalsMaintenanceLoop()
     {
@@ -28,6 +33,7 @@ internal sealed partial class BotSession
         }
 
         _signalsHttpClient.Timeout = SignalsHttpDescriptionTimeout;
+        ResetSignalsDiscoverySchedule(clearCache: false);
         _ = Task.Run(() => RunSignalsMaintenanceLoopAsync(_lifecycleCts.Token));
     }
 
@@ -36,6 +42,7 @@ internal sealed partial class BotSession
         while (!cancellationToken.IsCancellationRequested)
         {
             PruneSignalsCache(DateTimeOffset.UtcNow);
+            TryBroadcastSignalsDiscoveryAyt();
 
             try
             {
@@ -59,50 +66,147 @@ internal sealed partial class BotSession
         }
     }
 
-    private void TryProcessSignalsIngress(GridClient client, ChatEventArgs e, string text)
+    private void ResetSignalsDiscoverySchedule(bool clearCache)
     {
-        TryProcessSignalsIngress(
-            client,
-            e.SourceID,
-            e.OwnerID,
-            e.FromName,
-            e.Position,
-            e.Simulator,
-            e.SourceType,
-            channel: null,
-            text);
+        if (clearCache)
+        {
+            _signalsDiscoveryBySender.Clear();
+        }
+
+        lock (_signalsDiscoveryScheduleLock)
+        {
+            _signalsDiscoveryRegionHandle = 0UL;
+            _signalsNextDiscoveryBroadcastUtc = DateTimeOffset.UtcNow;
+        }
     }
 
-    private void TryProcessSignalsIngress(
+    private void NotifySignalsRegionChanged()
+    {
+        ResetSignalsDiscoverySchedule(clearCache: true);
+        TryBroadcastSignalsDiscoveryAyt();
+    }
+
+    private void TryBroadcastSignalsDiscoveryAyt()
+    {
+        var client = _client;
+        if (!_connected || client == null)
+        {
+            return;
+        }
+
+        var currentSim = client.Network.CurrentSim;
+        if (currentSim == null)
+        {
+            return;
+        }
+
+        var nowUtc = DateTimeOffset.UtcNow;
+        var shouldBroadcast = false;
+        lock (_signalsDiscoveryScheduleLock)
+        {
+            if (_signalsDiscoveryRegionHandle != currentSim.Handle)
+            {
+                shouldBroadcast = true;
+            }
+            else if (nowUtc >= _signalsNextDiscoveryBroadcastUtc)
+            {
+                shouldBroadcast = true;
+            }
+
+            if (shouldBroadcast)
+            {
+                _signalsDiscoveryRegionHandle = currentSim.Handle;
+                _signalsNextDiscoveryBroadcastUtc = nowUtc + ComputeNextSignalsDiscoveryBroadcastDelay();
+            }
+        }
+
+        if (!shouldBroadcast)
+        {
+            return;
+        }
+
+        var payload = $"{SignalsProtocolVersion}|AYT";
+        try
+        {
+            client.Self.Chat(payload, SignalsDiscoveryChannel, ChatType.Normal);
+            Console.WriteLine($"[signals] sent AYT discovery broadcast on channel {SignalsDiscoveryChannel}: {payload}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[signals] failed to send AYT discovery broadcast: {ex.Message}");
+        }
+    }
+
+    private TimeSpan ComputeNextSignalsDiscoveryBroadcastDelay()
+    {
+        var maxAgeSeconds = SignalsCacheMaxAge.TotalSeconds;
+        var adjustmentWindowSeconds = maxAgeSeconds * 0.15;
+        var floorSeconds = maxAgeSeconds - adjustmentWindowSeconds;
+        double randomizedReduction;
+        lock (_signalsDiscoveryScheduleLock)
+        {
+            randomizedReduction = _signalsRandom.NextDouble() * adjustmentWindowSeconds;
+        }
+
+        return TimeSpan.FromSeconds(Math.Max(5d, floorSeconds - randomizedReduction));
+    }
+
+    private void TryProcessSignalsIngress(GridClient client, ChatEventArgs e, string text)
+    {
+        if (e.SourceType != ChatSourceType.Object || e.SourceID == UUID.Zero)
+        {
+            return;
+        }
+
+        // Chat-based description fetch waits for the next object response from the requested sender.
+        if (_pendingSignalsDescriptionBySender.TryGetValue(e.SourceID, out var pending))
+        {
+            pending.Response.TrySetResult(text);
+        }
+    }
+
+    private bool TryProcessSignalsInstantIngress(GridClient client, UUID sourceId, string fromName, Vector3 position, string text)
+    {
+        if (sourceId == UUID.Zero || sourceId == client.Self.AgentID)
+        {
+            return false;
+        }
+
+        if (!text.StartsWith(SignalsIahPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!TryParseSignalsPrefixedIahPayload(text, out var protocolVersion, out var uri))
+        {
+            Console.WriteLine($"[signals] ignored malformed prefixed IAH IM from {fromName} [{sourceId}].");
+            return true;
+        }
+
+        UpsertSignalsDiscoveryEntry(
+            client,
+            sourceId,
+            UUID.Zero,
+            fromName,
+            position,
+            client.Network.CurrentSim,
+            protocolVersion,
+            uri);
+
+        Console.WriteLine($"[signals] received prefixed IAH IM from {fromName} [{sourceId}] uri={uri}");
+        return true;
+    }
+
+    private void UpsertSignalsDiscoveryEntry(
         GridClient client,
         UUID sourceId,
         UUID ownerId,
         string fromName,
         Vector3 position,
         Simulator? simulator,
-        ChatSourceType sourceType,
-        int? channel,
-        string text)
+        string protocolVersion,
+        string uri)
     {
-        if (sourceType != ChatSourceType.Object || sourceId == UUID.Zero)
-        {
-            return;
-        }
-
-        // Chat-based description fetch waits for the next object response from the requested sender.
-        if (_pendingSignalsDescriptionBySender.TryGetValue(sourceId, out var pending))
-        {
-            if (!channel.HasValue || channel.Value == pending.Channel)
-            {
-                pending.Response.TrySetResult(text);
-            }
-        }
-
-        if (!TryParseSignalsIahPayload(text, out var protocolVersion, out var uri))
-        {
-            return;
-        }
-
         var nowUtc = DateTimeOffset.UtcNow;
         var objectName = fromName;
         var objectDescription = string.Empty;
@@ -217,6 +321,21 @@ internal sealed partial class BotSession
         protocolVersion = parts[0].Trim();
         uri = parts[1].Trim();
         return true;
+    }
+
+    private static bool TryParseSignalsPrefixedIahPayload(string text, out string protocolVersion, out string uri)
+    {
+        protocolVersion = string.Empty;
+        uri = string.Empty;
+
+        var raw = text?.Trim() ?? string.Empty;
+        if (!raw.StartsWith(SignalsIahPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var payload = raw.Substring(SignalsIahPrefix.Length).Trim();
+        return TryParseSignalsIahPayload(payload, out protocolVersion, out uri);
     }
 
     public async Task<DataToolResult> SignalsNearbyAsync(string? agentUuid, float? radius, CancellationToken cancellationToken)
@@ -444,42 +563,6 @@ internal sealed partial class BotSession
         }
     }
 
-    private void OnRawChatFromSimulatorPacket(object? sender, PacketReceivedEventArgs e)
-    {
-        if (e.Packet is not ChatFromSimulatorPacket chatPacket)
-        {
-            return;
-        }
-
-        var client = _client;
-        if (client == null)
-        {
-            return;
-        }
-
-        var sourceId = chatPacket.ChatData.SourceID;
-        if (sourceId == UUID.Zero || sourceId == client.Self.AgentID)
-        {
-            return;
-        }
-
-        var text = Utils.BytesToString(chatPacket.ChatData.Message)?.Trim() ?? string.Empty;
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return;
-        }
-
-        TryProcessSignalsIngress(
-            client,
-            sourceId,
-            chatPacket.ChatData.OwnerID,
-            Utils.BytesToString(chatPacket.ChatData.FromName),
-            chatPacket.ChatData.Position,
-            e.Simulator,
-            (ChatSourceType)chatPacket.ChatData.SourceType,
-            channel: null,
-            text);
-    }
 }
 
 internal sealed class SignalDiscoveryCacheEntry

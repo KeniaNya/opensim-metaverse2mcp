@@ -351,7 +351,6 @@ internal sealed partial class BotSession : IDisposable
             client.Network.SimChanged += OnNetworkSimChanged;
             client.Self.IM += OnInstantMessage;
             client.Self.ChatFromSimulator += OnChatFromSimulator;
-            client.Network.RegisterCallback(PacketType.ChatFromSimulator, OnRawChatFromSimulatorPacket);
             EnsureSocialImHookRegistered(client);
             EnsureScriptDialogHookRegistered(client);
             client.Friends.FriendshipOffered += OnFriendshipOffered;
@@ -1578,6 +1577,7 @@ internal sealed partial class BotSession : IDisposable
 
                 QueueStartupSetupProvisioning("sim-change");
                 SchedulePostTeleportSimulatorCleanup(client, "sim-changed");
+                NotifySignalsRegionChanged();
 
                 Console.WriteLine("[sim-change] OnNetworkSimChanged: processing region transition.");
 
@@ -1627,6 +1627,7 @@ internal sealed partial class BotSession : IDisposable
     private void OnDisconnected(object? sender, DisconnectedEventArgs e)
     {
         _connected = false;
+        NotifySignalsRegionChanged();
         Interlocked.Exchange(ref _startupSetupProvisionState, 0);
         HandleVoiceDisconnected();
         StopFollowInternal();
@@ -1733,7 +1734,6 @@ internal sealed partial class BotSession : IDisposable
         try { client.Self.ScriptDialog -= OnScriptDialogReceived; } catch { }
         try { client.Self.ScriptQuestion -= OnScriptQuestionReceived; } catch { }
         try { client.Self.ChatFromSimulator -= OnChatFromSimulator; } catch { }
-        try { client.Network.UnregisterCallback(PacketType.ChatFromSimulator, OnRawChatFromSimulatorPacket); } catch { }
         try { client.Friends.FriendshipOffered -= OnFriendshipOffered; } catch { }
         try { client.Inventory.InventoryObjectOffered -= OnInventoryObjectOffered; } catch { }
         try { client.Objects.ObjectUpdate -= OnWorldObjectUpdateForEventStream; } catch { }
