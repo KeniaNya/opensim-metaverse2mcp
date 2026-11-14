@@ -15,9 +15,13 @@ internal sealed partial class BotSession
     private static readonly TimeSpan SignalsCachePruneInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan SignalsChatDescriptionTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan SignalsHttpDescriptionTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan SignalsOwnerRefreshTimeout = TimeSpan.FromSeconds(4);
+    private static readonly TimeSpan SignalsOwnerRefreshMinInterval = TimeSpan.FromSeconds(20);
 
     private readonly ConcurrentDictionary<UUID, SignalDiscoveryCacheEntry> _signalsDiscoveryBySender = new();
     private readonly ConcurrentDictionary<UUID, PendingSignalsDescriptionRequest> _pendingSignalsDescriptionBySender = new();
+    private readonly ConcurrentDictionary<UUID, DateTimeOffset> _signalsOwnerRefreshRequestedAt = new();
+    private readonly ConcurrentDictionary<UUID, byte> _signalsOwnerRefreshInFlight = new();
     private readonly HttpClient _signalsHttpClient = new();
     private readonly object _signalsDiscoveryScheduleLock = new();
     private readonly Random _signalsRandom = new();
@@ -62,6 +66,8 @@ internal sealed partial class BotSession
             if (nowUtc - pair.Value.LastHeardUtc > SignalsCacheMaxAge)
             {
                 _signalsDiscoveryBySender.TryRemove(pair.Key, out _);
+                _signalsOwnerRefreshRequestedAt.TryRemove(pair.Key, out _);
+                _signalsOwnerRefreshInFlight.TryRemove(pair.Key, out _);
             }
         }
     }
@@ -71,6 +77,8 @@ internal sealed partial class BotSession
         if (clearCache)
         {
             _signalsDiscoveryBySender.Clear();
+            _signalsOwnerRefreshRequestedAt.Clear();
+            _signalsOwnerRefreshInFlight.Clear();
         }
 
         lock (_signalsDiscoveryScheduleLock)
@@ -212,6 +220,8 @@ internal sealed partial class BotSession
         var objectDescription = string.Empty;
         var resolvedOwnerId = ownerId;
         var resolvedPosition = position;
+        Simulator? matchedSimulator = null;
+        uint? matchedLocalId = null;
         var regionName = simulator?.Name ?? client.Network.CurrentSim?.Name ?? string.Empty;
         var regionHandle = simulator?.Handle ?? client.Network.CurrentSim?.Handle ?? 0UL;
 
@@ -219,6 +229,8 @@ internal sealed partial class BotSession
         if (matched != null)
         {
             var (sim, prim) = matched.Value;
+            matchedSimulator = sim;
+            matchedLocalId = prim.LocalID;
             var properties = prim.Properties;
             objectName = !string.IsNullOrWhiteSpace(properties?.Name) ? properties.Name : objectName;
             objectDescription = properties?.Description ?? objectDescription;
@@ -258,6 +270,110 @@ internal sealed partial class BotSession
                 existing.ObjectDescription = objectDescription;
                 return existing;
             });
+
+        if (resolvedOwnerId == UUID.Zero)
+        {
+            TryScheduleSignalsOwnerRefresh(client, sourceId, matchedSimulator ?? simulator ?? client.Network.CurrentSim, matchedLocalId);
+        }
+    }
+
+    private void TryScheduleSignalsOwnerRefresh(GridClient client, UUID sourceId, Simulator? simulator, uint? localId)
+    {
+        if (sourceId == UUID.Zero || simulator == null)
+        {
+            return;
+        }
+
+        var nowUtc = DateTimeOffset.UtcNow;
+        if (_signalsOwnerRefreshRequestedAt.TryGetValue(sourceId, out var lastAttemptUtc)
+            && nowUtc - lastAttemptUtc < SignalsOwnerRefreshMinInterval)
+        {
+            return;
+        }
+
+        if (!_signalsOwnerRefreshInFlight.TryAdd(sourceId, 0))
+        {
+            return;
+        }
+
+        _signalsOwnerRefreshRequestedAt[sourceId] = nowUtc;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await RefreshSignalsOwnerByExactIdAsync(client, simulator, sourceId, localId, _lifecycleCts.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[signals] owner refresh failed for {sourceId}: {ex.Message}");
+            }
+            finally
+            {
+                _signalsOwnerRefreshInFlight.TryRemove(sourceId, out _);
+            }
+        });
+    }
+
+    private async Task RefreshSignalsOwnerByExactIdAsync(
+        GridClient client,
+        Simulator simulator,
+        UUID sourceId,
+        uint? localId,
+        CancellationToken cancellationToken)
+    {
+        var ownerTcs = new TaskCompletionSource<UUID>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        void OnObjectPropertiesFamily(object? sender, ObjectPropertiesFamilyEventArgs e)
+        {
+            if (e.Properties.ObjectID != sourceId || e.Properties.OwnerID == UUID.Zero)
+            {
+                return;
+            }
+
+            ownerTcs.TrySetResult(e.Properties.OwnerID);
+        }
+
+        void OnObjectPropertiesUpdated(object? sender, ObjectPropertiesUpdatedEventArgs e)
+        {
+            if ((e.Properties.ObjectID != sourceId && e.Prim.ID != sourceId) || e.Properties.OwnerID == UUID.Zero)
+            {
+                return;
+            }
+
+            ownerTcs.TrySetResult(e.Properties.OwnerID);
+        }
+
+        client.Objects.ObjectPropertiesFamily += OnObjectPropertiesFamily;
+        client.Objects.ObjectPropertiesUpdated += OnObjectPropertiesUpdated;
+
+        try
+        {
+            client.Objects.RequestObjectPropertiesFamily(simulator, sourceId);
+            if (localId.HasValue && localId.Value != 0)
+            {
+                client.Objects.SelectObject(simulator, localId.Value, automaticDeselect: true);
+            }
+
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            linkedCts.CancelAfter(SignalsOwnerRefreshTimeout);
+            var ownerId = await ownerTcs.Task.WaitAsync(linkedCts.Token).ConfigureAwait(false);
+
+            if (_signalsDiscoveryBySender.TryGetValue(sourceId, out var existing) && ownerId != UUID.Zero)
+            {
+                existing.OwnerId = ownerId;
+                Console.WriteLine($"[signals] owner resolved by exact ID for {sourceId}: {ownerId}");
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            Console.WriteLine($"[signals] owner refresh timed out for {sourceId}.");
+        }
+        finally
+        {
+            client.Objects.ObjectPropertiesFamily -= OnObjectPropertiesFamily;
+            client.Objects.ObjectPropertiesUpdated -= OnObjectPropertiesUpdated;
+        }
     }
 
     private static (Simulator Sim, Primitive Prim)? FindPrimInKnownSims(GridClient client, UUID objectId)

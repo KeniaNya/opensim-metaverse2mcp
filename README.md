@@ -29,7 +29,7 @@ The server logs in the bot on startup (no separate login tool), then serves MCP 
   - `ModelContextProtocol.AspNetCore`
 - Supports config via environment variables and CLI args (CLI overrides env).
 - Gives the Bot a voice via Piper and WebRTC (Janus) - Other stack parts required
-- Implements the [SIGNALS](SIGNALS.md) API that allows bots to discover and communicate with in-world objects (kind of acts like a mini-MCP proxy). 
+- Implements the [SIGNALS](SIGNALS_API.md) API that allows bots to discover and communicate with in-world objects (kind of acts like a mini-MCP proxy). 
 
 ## Volumes
 
