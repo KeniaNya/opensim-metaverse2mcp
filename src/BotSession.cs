@@ -351,6 +351,7 @@ internal sealed partial class BotSession : IDisposable
             client.Network.SimChanged += OnNetworkSimChanged;
             client.Self.IM += OnInstantMessage;
             client.Self.ChatFromSimulator += OnChatFromSimulator;
+            client.Network.RegisterCallback(PacketType.ChatFromSimulator, OnRawChatFromSimulatorPacket);
             EnsureSocialImHookRegistered(client);
             EnsureScriptDialogHookRegistered(client);
             client.Friends.FriendshipOffered += OnFriendshipOffered;
@@ -1732,6 +1733,7 @@ internal sealed partial class BotSession : IDisposable
         try { client.Self.ScriptDialog -= OnScriptDialogReceived; } catch { }
         try { client.Self.ScriptQuestion -= OnScriptQuestionReceived; } catch { }
         try { client.Self.ChatFromSimulator -= OnChatFromSimulator; } catch { }
+        try { client.Network.UnregisterCallback(PacketType.ChatFromSimulator, OnRawChatFromSimulatorPacket); } catch { }
         try { client.Friends.FriendshipOffered -= OnFriendshipOffered; } catch { }
         try { client.Inventory.InventoryObjectOffered -= OnInventoryObjectOffered; } catch { }
         try { client.Objects.ObjectUpdate -= OnWorldObjectUpdateForEventStream; } catch { }

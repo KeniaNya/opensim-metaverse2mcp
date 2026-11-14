@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Net.Http;
 using System.Text.Json;
 using LibreMetaverse;
+using LibreMetaverse.Packets;
 
 namespace Opensim.Metaverse2Mcp;
 
@@ -60,15 +61,41 @@ internal sealed partial class BotSession
 
     private void TryProcessSignalsIngress(GridClient client, ChatEventArgs e, string text)
     {
-        if (e.SourceType != ChatSourceType.Object || e.SourceID == UUID.Zero)
+        TryProcessSignalsIngress(
+            client,
+            e.SourceID,
+            e.OwnerID,
+            e.FromName,
+            e.Position,
+            e.Simulator,
+            e.SourceType,
+            channel: null,
+            text);
+    }
+
+    private void TryProcessSignalsIngress(
+        GridClient client,
+        UUID sourceId,
+        UUID ownerId,
+        string fromName,
+        Vector3 position,
+        Simulator? simulator,
+        ChatSourceType sourceType,
+        int? channel,
+        string text)
+    {
+        if (sourceType != ChatSourceType.Object || sourceId == UUID.Zero)
         {
             return;
         }
 
         // Chat-based description fetch waits for the next object response from the requested sender.
-        if (_pendingSignalsDescriptionBySender.TryGetValue(e.SourceID, out var pending))
+        if (_pendingSignalsDescriptionBySender.TryGetValue(sourceId, out var pending))
         {
-            pending.Response.TrySetResult(text);
+            if (!channel.HasValue || channel.Value == pending.Channel)
+            {
+                pending.Response.TrySetResult(text);
+            }
         }
 
         if (!TryParseSignalsIahPayload(text, out var protocolVersion, out var uri))
@@ -77,40 +104,40 @@ internal sealed partial class BotSession
         }
 
         var nowUtc = DateTimeOffset.UtcNow;
-        var objectName = e.FromName;
+        var objectName = fromName;
         var objectDescription = string.Empty;
-        var ownerId = e.OwnerID;
-        var position = e.Position;
-        var regionName = e.Simulator?.Name ?? client.Network.CurrentSim?.Name ?? string.Empty;
-        var regionHandle = e.Simulator?.Handle ?? client.Network.CurrentSim?.Handle ?? 0UL;
+        var resolvedOwnerId = ownerId;
+        var resolvedPosition = position;
+        var regionName = simulator?.Name ?? client.Network.CurrentSim?.Name ?? string.Empty;
+        var regionHandle = simulator?.Handle ?? client.Network.CurrentSim?.Handle ?? 0UL;
 
-        var matched = FindPrimInKnownSims(client, e.SourceID);
+        var matched = FindPrimInKnownSims(client, sourceId);
         if (matched != null)
         {
             var (sim, prim) = matched.Value;
             var properties = prim.Properties;
             objectName = !string.IsNullOrWhiteSpace(properties?.Name) ? properties.Name : objectName;
             objectDescription = properties?.Description ?? objectDescription;
-            ownerId = properties != null && properties.OwnerID != UUID.Zero
+            resolvedOwnerId = properties != null && properties.OwnerID != UUID.Zero
                 ? properties.OwnerID
-                : (prim.OwnerID != UUID.Zero ? prim.OwnerID : ownerId);
-            position = prim.Position;
+                : (prim.OwnerID != UUID.Zero ? prim.OwnerID : resolvedOwnerId);
+            resolvedPosition = prim.Position;
             regionName = sim.Name;
             regionHandle = sim.Handle;
         }
 
         _signalsDiscoveryBySender.AddOrUpdate(
-            e.SourceID,
+            sourceId,
             _ => new SignalDiscoveryCacheEntry
             {
-                SenderId = e.SourceID,
+                SenderId = sourceId,
                 ProtocolVersion = protocolVersion,
                 Uri = uri,
                 LastHeardUtc = nowUtc,
                 RegionName = regionName,
                 RegionHandle = regionHandle,
-                Position = position,
-                OwnerId = ownerId,
+                Position = resolvedPosition,
+                OwnerId = resolvedOwnerId,
                 ObjectName = objectName,
                 ObjectDescription = objectDescription
             },
@@ -121,8 +148,8 @@ internal sealed partial class BotSession
                 existing.LastHeardUtc = nowUtc;
                 existing.RegionName = regionName;
                 existing.RegionHandle = regionHandle;
-                existing.Position = position;
-                existing.OwnerId = ownerId;
+                existing.Position = resolvedPosition;
+                existing.OwnerId = resolvedOwnerId;
                 existing.ObjectName = objectName;
                 existing.ObjectDescription = objectDescription;
                 return existing;
@@ -378,7 +405,7 @@ internal sealed partial class BotSession
             requestResource = "SIGNALS.json";
         }
 
-        var pending = new PendingSignalsDescriptionRequest(requestResource);
+        var pending = new PendingSignalsDescriptionRequest(requestResource, chatChannel);
         if (!_pendingSignalsDescriptionBySender.TryAdd(senderId, pending))
         {
             return DataToolResult.FailResult("A Signals chat description request is already in-flight for this object sender.");
@@ -416,6 +443,43 @@ internal sealed partial class BotSession
             _pendingSignalsDescriptionBySender.TryRemove(senderId, out _);
         }
     }
+
+    private void OnRawChatFromSimulatorPacket(object? sender, PacketReceivedEventArgs e)
+    {
+        if (e.Packet is not ChatFromSimulatorPacket chatPacket)
+        {
+            return;
+        }
+
+        var client = _client;
+        if (client == null)
+        {
+            return;
+        }
+
+        var sourceId = chatPacket.ChatData.SourceID;
+        if (sourceId == UUID.Zero || sourceId == client.Self.AgentID)
+        {
+            return;
+        }
+
+        var text = Utils.BytesToString(chatPacket.ChatData.Message)?.Trim() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        TryProcessSignalsIngress(
+            client,
+            sourceId,
+            chatPacket.ChatData.OwnerID,
+            Utils.BytesToString(chatPacket.ChatData.FromName),
+            chatPacket.ChatData.Position,
+            e.Simulator,
+            (ChatSourceType)chatPacket.ChatData.SourceType,
+            channel: null,
+            text);
+    }
 }
 
 internal sealed class SignalDiscoveryCacheEntry
@@ -449,12 +513,15 @@ internal sealed record SignalNearbyObjectInfo(
 
 internal sealed class PendingSignalsDescriptionRequest
 {
-    public PendingSignalsDescriptionRequest(string requestResource)
+    public PendingSignalsDescriptionRequest(string requestResource, int channel)
     {
         RequestResource = requestResource;
+        Channel = channel;
     }
 
     public string RequestResource { get; }
+
+    public int Channel { get; }
 
     public TaskCompletionSource<string> Response { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 }

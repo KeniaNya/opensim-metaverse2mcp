@@ -526,8 +526,6 @@ internal sealed partial class BotSession
             return;
         }
 
-        TryProcessSignalsIngress(client, e, text);
-
         if (!_receiveChatAllowedTypes.Contains(e.Type))
         {
             Console.WriteLine($"[local] ignored ({e.SourceType}/{e.Type}) {e.FromName}: modality filtered by LOCAL_CHAT_ALLOWED_TYPES");
