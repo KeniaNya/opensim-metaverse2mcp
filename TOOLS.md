@@ -212,6 +212,14 @@ Social/friends notes:
 - Scripted text-box prompts (for example `llTextBox`) can be answered with `ScriptDialogTextInput(pendingDialogHandle, text)` using the same pending dialog handle.
 - Incoming object animation permission prompts emit runtime event `script.permission.animation.requested` on channel `general`; use `pendingPermissionHandle` with `ScriptAnimationPermissionRespond`.
 
+Signals notes:
+- Discovery runs on channel `-44448888`; the bot broadcasts `1|AYT` when entering a region and then periodically.
+- Object discovery replies are accepted only as IM envelopes in this form: `_SIGNALS_:<version>|IAH|<uri>`.
+- `signals_nearby` returns cached discoveries for the current simulator (and optional owner/radius filters) with sender/protocol/URI/object/region/position metadata.
+- `signals_nearby` response object rows do not include `OwnerId`.
+- `signals_description` for `chat://` URIs sends `SIGNALS.json`/`SIGNALS.md` request text on the target channel, then waits for `_SIGNALS_:<version>|SIG|<textContent>` from the requested sender.
+- While waiting for chat description replies, non-prefixed messages and non-`SIG` envelopes are ignored until timeout.
+
 Chat notes:
 - `Chat` accepts optional `chatType` (case-insensitive) and defaults to `Normal`.
 - Supported `chatType` values are `Whisper`, `Normal`, `Shout`, `StartTyping`, `StopTyping`, `Debug`, `OwnerSay`, `RegionSayTo`, `RegionSay`.

@@ -158,10 +158,14 @@ internal sealed partial class BotSession
             return;
         }
 
-        // Chat-based description fetch waits for the next object response from the requested sender.
+        // Chat-based description fetch waits for a Signals SIG envelope response
+        // from the requested sender. Non-envelope/object chat is ignored.
         if (_pendingSignalsDescriptionBySender.TryGetValue(e.SourceID, out var pending))
         {
-            pending.Response.TrySetResult(text);
+            if (TryParseSignalsSigEnvelope(text, out var contentText))
+            {
+                pending.Response.TrySetResult(contentText);
+            }
         }
     }
 
@@ -328,6 +332,48 @@ internal sealed partial class BotSession
         protocolVersion = string.Empty;
         uri = string.Empty;
 
+        if (!TryParseSignalsEnvelope(text, out var parsedVersion, out var envelopeType, out var content))
+        {
+            return false;
+        }
+
+        if (!string.Equals(envelopeType, "IAH", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!TryParseSignalsIahPayload($"{parsedVersion}|{content}", out protocolVersion, out uri))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool TryParseSignalsSigEnvelope(string text, out string contentText)
+    {
+        contentText = string.Empty;
+
+        if (!TryParseSignalsEnvelope(text, out _, out var envelopeType, out var content))
+        {
+            return false;
+        }
+
+        if (!string.Equals(envelopeType, "SIG", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        contentText = content;
+        return true;
+    }
+
+    private static bool TryParseSignalsEnvelope(string text, out string protocolVersion, out string envelopeType, out string content)
+    {
+        protocolVersion = string.Empty;
+        envelopeType = string.Empty;
+        content = string.Empty;
+
         var raw = text?.Trim() ?? string.Empty;
         if (!raw.StartsWith(SignalsIahPrefix, StringComparison.OrdinalIgnoreCase))
         {
@@ -335,7 +381,23 @@ internal sealed partial class BotSession
         }
 
         var payload = raw.Substring(SignalsIahPrefix.Length).Trim();
-        return TryParseSignalsIahPayload(payload, out protocolVersion, out uri);
+        var parts = payload.Split('|', 3, StringSplitOptions.None);
+        if (parts.Length != 3)
+        {
+            return false;
+        }
+
+        var parsedVersion = parts[0].Trim();
+        var parsedType = parts[1].Trim();
+        if (string.IsNullOrWhiteSpace(parsedVersion) || string.IsNullOrWhiteSpace(parsedType))
+        {
+            return false;
+        }
+
+        protocolVersion = parsedVersion;
+        envelopeType = parsedType;
+        content = parts[2];
+        return true;
     }
 
     public async Task<DataToolResult> SignalsNearbyAsync(string? agentUuid, float? radius, CancellationToken cancellationToken)
