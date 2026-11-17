@@ -159,14 +159,37 @@ internal sealed partial class BotSession
         }
 
         // Chat-based description fetch waits for a Signals SIG envelope response
-        // from the requested sender. Non-envelope/object chat is ignored.
+        // from the requested sender. Non-SIG chat remains eligible for IAH parsing below.
         if (_pendingSignalsDescriptionBySender.TryGetValue(e.SourceID, out var pending))
         {
             if (TryParseSignalsSigEnvelope(text, out var contentText))
             {
                 pending.Response.TrySetResult(contentText);
+                return;
             }
         }
+
+        if (!text.StartsWith(SignalsIahPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        if (!TryParseSignalsPrefixedIahPayload(text, out var protocolVersion, out var uri))
+        {
+            return;
+        }
+
+        UpsertSignalsDiscoveryEntry(
+            client,
+            e.SourceID,
+            UUID.Zero,
+            e.FromName,
+            e.Position,
+            e.Simulator,
+            protocolVersion,
+            uri);
+
+        Console.WriteLine($"[signals] received prefixed IAH chat from {e.FromName} [{e.SourceID}] uri={uri}");
     }
 
     private bool TryProcessSignalsInstantIngress(GridClient client, UUID sourceId, string fromName, Vector3 position, string text)
@@ -181,9 +204,20 @@ internal sealed partial class BotSession
             return false;
         }
 
+        // chat:// description responses can arrive via IM as SIG envelopes.
+        if (TryParseSignalsSigEnvelope(text, out var sigContent))
+        {
+            if (_pendingSignalsDescriptionBySender.TryGetValue(sourceId, out var pending))
+            {
+                pending.Response.TrySetResult(sigContent);
+            }
+
+            return true;
+        }
+
         if (!TryParseSignalsPrefixedIahPayload(text, out var protocolVersion, out var uri))
         {
-            Console.WriteLine($"[signals] ignored malformed prefixed IAH IM from {fromName} [{sourceId}].");
+            Console.WriteLine($"[signals] ignored malformed prefixed Signals IM from {fromName} [{sourceId}].");
             return true;
         }
 
