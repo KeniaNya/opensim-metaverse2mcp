@@ -11,6 +11,7 @@ internal sealed partial class BotSession
     private const int SignalsDiscoveryChannel = -44448888;
     private const string SignalsProtocolVersion = "1";
     private const string SignalsIahPrefix = "_SIGNALS_:";
+    private const string SignalsOwnerKeyHeaderName = "x-secondlife-owner-key";
     private static readonly TimeSpan SignalsCacheMaxAge = TimeSpan.FromSeconds(300);
     private static readonly TimeSpan SignalsCachePruneInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan SignalsChatDescriptionTimeout = TimeSpan.FromSeconds(5);
@@ -548,7 +549,7 @@ internal sealed partial class BotSession
             var scheme = uri.Scheme.ToLowerInvariant();
             if (scheme == "http" || scheme == "https")
             {
-                return await FetchSignalsDescriptionOverHttpAsync(senderId, cached, uri, token).ConfigureAwait(false);
+                return await FetchSignalsDescriptionOverHttpAsync(client, senderId, cached, uri, token).ConfigureAwait(false);
             }
 
             if (scheme == "chat")
@@ -561,6 +562,7 @@ internal sealed partial class BotSession
     }
 
     private async Task<DataToolResult> FetchSignalsDescriptionOverHttpAsync(
+        GridClient client,
         UUID senderId,
         SignalDiscoveryCacheEntry cached,
         Uri uri,
@@ -572,6 +574,8 @@ internal sealed partial class BotSession
             linkedCts.CancelAfter(SignalsHttpDescriptionTimeout);
 
             using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+            // Signals HTTP listeners use this as a hint for the requesting avatar identity.
+            request.Headers.TryAddWithoutValidation(SignalsOwnerKeyHeaderName, client.Self.AgentID.ToString());
             using var response = await _signalsHttpClient.SendAsync(request, linkedCts.Token).ConfigureAwait(false);
             var content = await response.Content.ReadAsStringAsync(linkedCts.Token).ConfigureAwait(false);
 
