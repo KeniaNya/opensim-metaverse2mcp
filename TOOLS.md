@@ -97,6 +97,8 @@ The server publishes tools including:
 - `PrimRezFromInventory`
 - `PrimFindByName`
 - `PrimListNearby`
+- `PrimChildren`
+- `AvatarsNearby`
 - `PrimQueryObjects`
 - `PrimRequestPayPrice`
 - `PrimBuy`
@@ -105,12 +107,16 @@ The server publishes tools including:
 - `InventoryList`
 - `InventoryListRetrieve`
 - `InventoryListClear`
+- `InventorySearch`
 - `LandmarkList`
 - `LandmarkCreate`
 - `InventoryGiveItem`
 - `InventoryGiveFolder`
 - `TaskInventoryList`
 - `TaskInventoryTake`
+- `TaskInventoryAdd`
+- `TaskInventoryRemove`
+- `InventoryReadText`
 - `AssetUploadInventory`
 - `AssetDownload`
 - `TextureDownload`
@@ -322,7 +328,9 @@ Agent lookup notes:
 Animation notes:
 - `AnimationStart`/`AnimationStop` accept either a built-in animation name (e.g. `DANCE1`, `WAVE`, `CLAP`, `SIT`) or a raw animation UUID.
 - `AnimationsList` returns all built-in animation names/UUIDs from LibreMetaverse's `Animations` class.
-- `ActiveAnimations` returns the bot's currently signaled animations with their sequence IDs.
+- `ActiveAnimations(agentId?, resolveNames?)` returns the animations playing on the bot, or on another avatar when `agentId` is given, with their sequence IDs.
+- Custom animations (furniture poses, AOs, HUDs) carry no name on the wire. For the bot's own animations each entry reports the object that started it (`sourceObjectId`, `sourceObjectName`, `sourceObjectLocalId`, `sourceIsAttachment`); the simulator does not send sources for other avatars.
+- With `resolveNames` (default `true`) a custom animation gets its inventory name when the source object discloses the asset ids of its contents, which it does for objects the bot owns or can modify (its own attachments included). Otherwise the entry's `name` is the animation UUID.
 
 Environment notes:
 - `EnvGetRegion`/`EnvGetParcel` return a structured result with `PayloadJson` containing the LLSD object as JSON.
@@ -360,7 +368,13 @@ Inventory and asset notes:
 - `MeshUploadGltf` uploads mesh assets from local paths or HTTP sources and returns created inventory/asset IDs plus conversion warnings when present.
 - For production workflows, run `MeshInspectGltf` in strict mode before `MeshUploadGltf` to prevent partial uploads.
 - Incoming inventory offers are policy-driven: first matching rule decides `accept` or `decline`; unmatched offers are declined by default.
+- `AssetUploadInventory` with a notecard type creates the notecard item and then uploads its body through the notecard capability; plain text is wrapped in the Linden notecard container, a source that already starts with `Linden text version` is uploaded unchanged.
+- `AssetDownload` with `assetType=Mesh` uses the mesh capability and returns the raw LLMesh asset; with `assetType=Material` it returns the glTF material asset (LLSD wrapping the material JSON).
+- `InventorySearch(nameContains, maxResults?, type?, folderIdOrPath?)` is an instant name search over the inventory the client has already cached; it reports how many folders had no cached contents so the caller knows when to run `InventoryList` on them first.
 - `TaskInventoryTake` requests transfer from object (task) inventory into avatar inventory; server permissions determine copy-vs-move behavior.
+- `TaskInventoryAdd(objectLocalId, inventoryItemId, enableScript?, forceOverwrite?, allowMoveNoCopy?)` copies any agent inventory item (texture, animation, sound, notecard, script, object...) into an object's contents. Links are rejected. A no-copy item is refused unless `allowMoveNoCopy=true`, because adding it moves the only copy out of agent inventory.
+- `TaskInventoryRemove(objectLocalId, taskItemId, objectId?)` deletes a contents item. The item is destroyed, not returned; use `TaskInventoryTake` first to keep it.
+- `InventoryReadText(itemId, objectLocalId?, objectId?, maxChars?)` returns the text of a notecard or script, from agent inventory or in place from an object's contents (`itemId` is then the task item UUID). Notecards report their embedded item count; the result carries `length` and `truncated`.
 - Cross-avatar "take/copy" is offer-based: you can receive what another avatar offers, but cannot arbitrarily pull from another avatar inventory.
 - `InventoryOfferPolicyRulesSave`/`InventoryOfferPolicyRulesLoad` persist policy rules as JSON; startup auto-load occurs when `INVENTORY_OFFER_POLICY_FILE` exists.
 - `LandmarkCreate` creates landmark assets/items in inventory using either current position or explicit local coordinates in the current region.
@@ -384,6 +398,7 @@ Appearance and script notes:
 - `ListOutfits` returns folder names/UUIDs found under the My Outfits root (with fallback to a root folder named `My Outfits`/`Outfits`).
 - `AppearanceWearOutfit` resolves an outfit by name under My Outfits and updates only the COF outfit-folder link (it does not directly wear attachments/wearables).
 - `AppearanceAttachItem` can use an explicit `attachmentPoint`, or falls back to the item's default point when available.
+- `AppearanceAttachItem` and `AppearanceDetachItem` take `persist` (default `true`): the request goes through the Current Outfit Folder, so the attachment (or its removal) survives relogin. `persist=false` is a session-only attach/detach.
 - `AvatarAppearanceListWorn` reports another avatar's currently known attachment object UUIDs from simulator cache and includes local IDs when resolvable.
 - `AvatarCacheList` is a diagnostics tool that dumps all currently cached `ObjectAvatars` entries across known simulators (including attachment snapshots per entry).
 - `AvatarAttachmentTouch` is a convenience wrapper that resolves a target attachment (by `objectId` or `attachmentPoint`) and performs `client.Self.Touch(localId)` in one call.
@@ -396,6 +411,20 @@ Appearance and script notes:
 
 Inventory notes:
 - `InventoryListRetrieve` returns `assetId` on item rows (folders return `null`), so you can pass that UUID directly to `AssetDownload`.
+
+Scene and object notes:
+- `PrimListNearby(radiusMeters, maxResults, includeAttachments?, rootsOnly?, nameContains?, loadNames?)` lists prims nearest first. Rows carry `name`, `description`, `hoverText` (floating text) and `isAttachment`. Names and descriptions are not part of object updates, so with `loadNames` (default `true`) missing ones are requested from the simulator with properties-family requests (nothing is selected) and awaited for up to about 2.5 s.
+- `PrimFindByName` loads the names of the nearest unnamed root objects before searching.
+- `PrimChildren(localId, recursive?, maxResults?)` lists the child prims of a linkset or HUD root, or the attachments of an avatar when given an avatar local ID.
+- `AvatarsNearby(radiusMeters?, maxResults?)` lists avatars with names, local IDs, positions, distances and sitting state. The bot is included (`isSelf`) and `selfLocalId` is returned.
+- `PrimInspect(localId, includeFaceTextures)` reports `hoverText` and `isAttachment`. With `includeFaceTextures`, each face lists its texture entry (texture id, repeats, offsets, rotation, colour, alpha, glow, fullbright; `faceIndex -1` is the default entry) and, when the face has a PBR (glTF) material, a `pbr` object: `materialId`, `loaded`, `hasOverride`, `baseColorTextureId`, `baseColorR/G/B/A`, `alphaMode`, `alphaCutoff`, `doubleSided`, the base colour texture transform, emissive, normal and metallic-roughness texture ids and factors. On a PBR face the texture entry is normally blank; the `pbr` values are what a viewer draws.
+- For a mesh prim, `sculpt.sculptTextureId` in `PrimInspect` is the mesh asset id, downloadable with `AssetDownload(assetType="Mesh")`; face index N is mesh submesh N.
+- `PrimSetTexture(localId, textureId, faceIndex)` takes the texture's asset id (the `assetId` of an inventory item, not its item id). `faceIndex=-1` sets every face.
+- Texture edits (`PrimSetTexture`, `PrimSetFaceParams`, the UV nudge/tile/preset tools) build on the bot's own last edit of that prim for five seconds, so quick consecutive edits do not overwrite each other while the simulator echo is still in flight.
+- Scripted-object chat (`llSay`, `llOwnerSay`...) arrives on the event stream as `chat.local.received` with `isObject=True`, `objectId`, `objectName` and `ownerId`. It is never routed to the conversation handler.
+
+Host notes:
+- `POST /shutdown` (loopback only) logs the bot out and stops the host, for local supervisors that rebuild and relaunch.
 
 ## Common workflows
 
