@@ -160,8 +160,8 @@ internal sealed partial class BotSession
         return await ExecuteLockedAsync((client, _) =>
         {
             var store = client.Inventory.Store;
-            var root = store.RootFolder;
-            if (root == null)
+            var root = store?.RootFolder;
+            if (store == null || root == null)
             {
                 return Task.FromResult(DataToolResult.FailResult("Inventory root is not loaded yet."));
             }
