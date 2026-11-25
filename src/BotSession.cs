@@ -354,6 +354,7 @@ internal sealed partial class BotSession : IDisposable
             EnsureSocialImHookRegistered(client);
             EnsureScriptDialogHookRegistered(client);
             client.Avatars.AvatarAnimation += OnAvatarAnimationForSenses;
+            RegisterRenderMaterialHooks(client);
             client.Friends.FriendshipOffered += OnFriendshipOffered;
             client.Inventory.InventoryObjectOffered += OnInventoryObjectOffered;
             client.Objects.ObjectUpdate += OnWorldObjectUpdateForEventStream;
@@ -1735,6 +1736,7 @@ internal sealed partial class BotSession : IDisposable
         try { client.Self.ScriptDialog -= OnScriptDialogReceived; } catch { }
         try { client.Self.ScriptQuestion -= OnScriptQuestionReceived; } catch { }
         try { client.Avatars.AvatarAnimation -= OnAvatarAnimationForSenses; } catch { }
+        UnregisterRenderMaterialHooks(client);
         try { client.Self.ChatFromSimulator -= OnChatFromSimulator; } catch { }
         try { client.Friends.FriendshipOffered -= OnFriendshipOffered; } catch { }
         try { client.Inventory.InventoryObjectOffered -= OnInventoryObjectOffered; } catch { }

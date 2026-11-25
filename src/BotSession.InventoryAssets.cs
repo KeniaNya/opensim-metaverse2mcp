@@ -4599,7 +4599,13 @@ internal sealed partial class BotSession
             Asset? asset = parsedAssetType == AssetType.Mesh
                 ? await client.Assets.RequestMeshAsync(assetUuid, token).ConfigureAwait(false)
                 : await client.Assets.RequestAssetAsync(assetUuid, parsedAssetType, true, token).ConfigureAwait(false);
-            if (asset?.AssetData == null)
+            var assetData = asset?.AssetData;
+            if (assetData == null && parsedAssetType == AssetType.Material)
+            {
+                assetData = await DownloadMaterialAssetAsync(client, null, assetUuid, token).ConfigureAwait(false);
+            }
+
+            if (assetData == null)
             {
                 return AssetDownloadResult.FailResult($"Unable to download asset {assetUuid} as type {parsedAssetType}.");
             }
@@ -4610,12 +4616,12 @@ internal sealed partial class BotSession
                 return AssetDownloadResult.FailResult("Workspace directory is not configured.");
             }
 
-            var payload = await BuildDownloadPayloadAsync(workspaceDir, asset.AssetData, mode, fileNameHint, parsedAssetType, token).ConfigureAwait(false);
+            var payload = await BuildDownloadPayloadAsync(workspaceDir, assetData, mode, fileNameHint, parsedAssetType, token).ConfigureAwait(false);
             return AssetDownloadResult.OkResult(
                 payload.Base64,
                 payload.FilePath,
-                asset.AssetData.Length,
-                asset.AssetID.ToString(),
+                assetData.Length,
+                assetUuid.ToString(),
                 parsedAssetType.ToString(),
                 "Asset download completed.");
         }, cancellationToken).ConfigureAwait(false);
