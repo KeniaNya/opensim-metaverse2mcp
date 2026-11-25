@@ -506,10 +506,13 @@ internal sealed class BotMcpTools
         return _bot.AnimationsListAsync(cancellationToken);
     }
 
-    [McpServerTool, Description("List currently active/signaled animations for the bot.")]
-    public Task<AnimationListResult> ActiveAnimations(CancellationToken cancellationToken)
+    [McpServerTool, Description("List the animations currently playing on the bot, or on another avatar. Built-in animations are named; custom ones (poses from furniture, AOs, HUDs) carry no name on the wire and are listed by asset UUID together with the object that started them.")]
+    public Task<AnimationListResult> ActiveAnimations(
+        [Description("Optional avatar UUID. Omit for the bot itself.")] string? agentId = null,
+        [Description("Look inside the objects that started custom animations to find their names (works for objects the bot owns or can modify; cached for 5 minutes).")] bool resolveNames = true,
+        CancellationToken cancellationToken = default)
     {
-        return _bot.ActiveAnimationsAsync(cancellationToken);
+        return _bot.ActiveAnimationsAsync(agentId, resolveNames, cancellationToken);
     }
 
     [McpServerTool, Description("Send a local chat message.")]
