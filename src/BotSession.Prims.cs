@@ -1086,17 +1086,24 @@ internal sealed partial class BotSession
             return PrimQueryResult.FailResult("name is required.");
         }
 
-        return await ExecuteLockedAsync((client, _) =>
+        return await ExecuteLockedAsync(async (client, token) =>
         {
             var sim = client.Network.CurrentSim;
             if (sim == null)
             {
-                return Task.FromResult(PrimQueryResult.FailResult("No current simulator available."));
+                return PrimQueryResult.FailResult("No current simulator available.");
             }
 
             var limit = Math.Clamp(maxResults, 1, 500);
             var comparison = caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
             var at = client.Self.SimPosition;
+
+            // A name search over a cache that has no names finds nothing: load the names of the
+            // nearest root objects first (the helper caps how many it asks for per call).
+            var unnamedRoots = sim.ObjectsPrimitives.Values
+                .Where(p => p != null && p.ParentID == 0 && !p.IsAttachment && p.Properties == null)
+                .OrderBy(p => Vector3.Distance(at, p.Position));
+            await EnsurePrimNamesAsync(client, sim, unnamedRoots, token).ConfigureAwait(false);
 
             var prims = sim.ObjectsPrimitives.Values
                 .Where(p => !string.IsNullOrWhiteSpace(p.Properties?.Name)
@@ -1107,7 +1114,7 @@ internal sealed partial class BotSession
                 .Take(limit)
                 .ToList();
 
-            return Task.FromResult(PrimQueryResult.OkResult(prims, $"Matched {prims.Count} prim(s)."));
+            return PrimQueryResult.OkResult(prims, $"Matched {prims.Count} prim(s).");
         }, cancellationToken).ConfigureAwait(false);
     }
 
@@ -1117,6 +1124,7 @@ internal sealed partial class BotSession
         bool includeAttachments,
         bool rootsOnly,
         string? nameContains,
+        bool loadNames,
         CancellationToken cancellationToken)
     {
         if (radiusMeters <= 0f)
@@ -1124,12 +1132,12 @@ internal sealed partial class BotSession
             return PrimQueryResult.FailResult("radiusMeters must be greater than 0.");
         }
 
-        return await ExecuteLockedAsync((client, _) =>
+        return await ExecuteLockedAsync(async (client, token) =>
         {
             var sim = client.Network.CurrentSim;
             if (sim == null)
             {
-                return Task.FromResult(PrimQueryResult.FailResult("No current simulator available."));
+                return PrimQueryResult.FailResult("No current simulator available.");
             }
 
             var limit = Math.Clamp(maxResults, 1, 500);
@@ -1137,24 +1145,118 @@ internal sealed partial class BotSession
             var at = client.Self.SimPosition;
 
             var needle = string.IsNullOrWhiteSpace(nameContains) ? null : nameContains.Trim();
-            var prims = sim.ObjectsPrimitives.Values
+            var candidates = sim.ObjectsPrimitives.Values
                 .Where(p => p != null)
                 // Attachments carry positions relative to their wearer, so they never pass a
                 // distance filter; include them explicitly when asked (distance reported as 0).
                 .Where(p => includeAttachments || !p.IsAttachment)
                 .Where(p => !rootsOnly || p.ParentID == 0 || p.IsAttachment)
+                .Where(p => p.IsAttachment || Vector3.Distance(at, p.Position) <= radius)
+                .OrderBy(p => p.IsAttachment ? 0f : Vector3.Distance(at, p.Position))
+                .ThenBy(p => p.LocalID)
+                .ToList();
+
+            var namesLoaded = 0;
+            if (loadNames)
+            {
+                // With a name filter every candidate needs its name; without one only the rows returned do.
+                var needNames = needle == null ? candidates.Take(limit) : candidates;
+                namesLoaded = await EnsurePrimNamesAsync(client, sim, needNames, token).ConfigureAwait(false);
+            }
+
+            var prims = candidates
                 .Select(p => p.IsAttachment ? ToPrimSummary(p, p.Position) : ToPrimSummary(p, at))
-                .Where(p => p.DistanceMeters <= radius)
                 .Where(p => needle == null
                             || (p.Name?.Contains(needle, StringComparison.OrdinalIgnoreCase) ?? false)
+                            || (p.Description?.Contains(needle, StringComparison.OrdinalIgnoreCase) ?? false)
                             || (p.HoverText?.Contains(needle, StringComparison.OrdinalIgnoreCase) ?? false))
-                .OrderBy(p => p.DistanceMeters)
-                .ThenBy(p => p.LocalId)
                 .Take(limit)
                 .ToList();
 
-            return Task.FromResult(PrimQueryResult.OkResult(prims, $"Found {prims.Count} nearby prim(s) within {radius:F2}m."));
+            var unnamed = prims.Count(p => p.Name == null);
+            return PrimQueryResult.OkResult(
+                prims,
+                $"Found {prims.Count} nearby prim(s) within {radius:F2}m."
+                + (namesLoaded > 0 ? $" Loaded names for {namesLoaded}." : string.Empty)
+                + (unnamed > 0 ? $" {unnamed} have no name yet." : string.Empty));
         }, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static readonly TimeSpan PrimNameFetchTimeout = TimeSpan.FromSeconds(2.5);
+    private static readonly TimeSpan PrimNameRequestCooldown = TimeSpan.FromSeconds(30);
+    private const int PrimNameFetchMaxPerCall = 300;
+    private readonly ConcurrentDictionary<UUID, DateTimeOffset> _primNameRequestedAtByObjectId = new();
+
+    // Names and descriptions are not part of object updates; a viewer asks for them when the
+    // pointer hovers an object. Ask for the ones we lack (a properties-family request, so
+    // nothing gets selected and no edit beam shows) and wait briefly for the replies.
+    private async Task<int> EnsurePrimNamesAsync(GridClient client, Simulator sim, IEnumerable<Primitive> prims, CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (_primNameRequestedAtByObjectId.Count > 5000)
+        {
+            _primNameRequestedAtByObjectId.Clear();
+        }
+
+        var pending = new Dictionary<UUID, Primitive>();
+        foreach (var prim in prims)
+        {
+            if (prim == null || prim.ID == UUID.Zero || prim.Properties != null)
+            {
+                continue;
+            }
+
+            if (_primNameRequestedAtByObjectId.TryGetValue(prim.ID, out var requestedAt)
+                && now - requestedAt < PrimNameRequestCooldown)
+            {
+                continue;
+            }
+
+            pending[prim.ID] = prim;
+            if (pending.Count >= PrimNameFetchMaxPerCall)
+            {
+                break;
+            }
+        }
+
+        if (pending.Count == 0)
+        {
+            return 0;
+        }
+
+        void OnObjectPropertiesFamily(object? sender, ObjectPropertiesFamilyEventArgs e)
+        {
+            if (!ReferenceEquals(e.Simulator, sim) || !pending.TryGetValue(e.Properties.ObjectID, out var prim))
+            {
+                return;
+            }
+
+            prim.Properties ??= new Primitive.ObjectProperties();
+            prim.Properties.SetFamilyProperties(e.Properties);
+            _primPropertiesRefreshedAtByObjectId[prim.ID] = DateTimeOffset.UtcNow;
+        }
+
+        client.Objects.ObjectPropertiesFamily += OnObjectPropertiesFamily;
+        try
+        {
+            foreach (var prim in pending.Values)
+            {
+                _primNameRequestedAtByObjectId[prim.ID] = now;
+                client.Objects.RequestObjectPropertiesFamily(sim, prim.ID);
+            }
+
+            var deadline = now + PrimNameFetchTimeout;
+            while (DateTimeOffset.UtcNow < deadline && pending.Values.Any(prim => prim.Properties == null))
+            {
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            client.Objects.ObjectPropertiesFamily -= OnObjectPropertiesFamily;
+        }
+
+        return pending.Values.Count(prim => prim.Properties != null);
     }
 
     public async Task<BotToolResult> SetPrimNameAsync(uint localId, string name, CancellationToken cancellationToken)
@@ -1410,7 +1512,8 @@ internal sealed partial class BotSession
             prim.Position.Z,
             Vector3.Distance(at, prim.Position),
             prim.IsAttachment,
-            string.IsNullOrWhiteSpace(prim.Text) ? null : prim.Text);
+            string.IsNullOrWhiteSpace(prim.Text) ? null : prim.Text,
+            string.IsNullOrWhiteSpace(prim.Properties?.Description) ? null : prim.Properties!.Description);
     }
 
     private async Task<Primitive?> WaitForCreatedPrimAsync(
@@ -1572,7 +1675,8 @@ internal sealed record PrimSummary(
     float PositionZ,
     float DistanceMeters,
     bool IsAttachment = false,
-    string? HoverText = null);
+    string? HoverText = null,
+    string? Description = null);
 
 internal sealed record PrimInfo(
     uint LocalId,

@@ -2272,16 +2272,17 @@ internal sealed class BotMcpTools
         return _bot.FindPrimsByNameAsync(name, maxResults, caseSensitive, cancellationToken);
     }
 
-    [McpServerTool, Description("List nearby prims around the bot in the current simulator cache. Each entry carries hoverText (floating text) and isAttachment.")]
+    [McpServerTool, Description("List nearby prims around the bot, nearest first. Each entry carries name, description, hoverText (floating text) and isAttachment; names are fetched from the simulator when the cache lacks them.")]
     public Task<PrimQueryResult> PrimListNearby(
         [Description("Radius in meters.")] float radiusMeters,
         [Description("Maximum number of results (1..500).") ] int maxResults,
         [Description("Include worn attachments (the bot's and other avatars'); their distance is reported as 0.")] bool includeAttachments = false,
         [Description("Only root prims (skip child prims of linksets).")] bool rootsOnly = false,
-        [Description("Optional case-insensitive filter on name or hover text.")] string? nameContains = null,
+        [Description("Optional case-insensitive filter on name, description or hover text.")] string? nameContains = null,
+        [Description("Ask the simulator for names and descriptions the cache does not have yet (waits up to about 2.5 s the first time). False = answer from the cache only.")] bool loadNames = true,
         CancellationToken cancellationToken = default)
     {
-        return _bot.ListNearbyPrimsAsync(radiusMeters, maxResults, includeAttachments, rootsOnly, nameContains, cancellationToken);
+        return _bot.ListNearbyPrimsAsync(radiusMeters, maxResults, includeAttachments, rootsOnly, nameContains, loadNames, cancellationToken);
     }
 
     [McpServerTool, Description("List the child prims of an object (or the attachments of an avatar) by parent local ID, from the simulator cache. Works for HUD roots and linksets.")]
