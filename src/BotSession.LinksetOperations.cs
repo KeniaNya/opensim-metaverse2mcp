@@ -76,18 +76,19 @@ internal sealed partial class BotSession
                 return Task.FromResult(BotToolResult.OkResult($"Prim {newRootLocalId} is already the root prim."));
             }
 
+            // The simulator makes the first prim of a link request the root.
             var ordered = members
                 .Select(p => p.LocalID)
                 .Where(id => id != newRootLocalId)
                 .ToList();
-            ordered.Add(newRootLocalId);
+            ordered.Insert(0, newRootLocalId);
 
             var allIds = members.Select(p => p.LocalID).ToList();
             client.Objects.DelinkPrims(sim, allIds);
             client.Objects.LinkPrims(sim, ordered);
 
             return Task.FromResult(BotToolResult.OkResult(
-                $"Re-link request sent to set root {newRootLocalId} (previous root {currentRootLocalId}). Link order={string.Join(",", ordered)} (root is last)."));
+                $"Re-link request sent to set root {newRootLocalId} (previous root {currentRootLocalId}). Link order={string.Join(",", ordered)} (root is first)."));
         }, cancellationToken).ConfigureAwait(false);
     }
 
@@ -134,13 +135,13 @@ internal sealed partial class BotSession
             }
 
             var ordered = orderedIds.Where(id => id != rootLocalId).ToList();
-            ordered.Add(rootLocalId);
+            ordered.Insert(0, rootLocalId);
 
             client.Objects.DelinkPrims(sim, linksetIds);
             client.Objects.LinkPrims(sim, ordered);
 
             return Task.FromResult(BotToolResult.OkResult(
-                $"Re-link request sent. Root {rootLocalId} (was {currentRootLocalId}), ordered links={string.Join(",", ordered)} (root is last)."));
+                $"Re-link request sent. Root {rootLocalId} (was {currentRootLocalId}), ordered links={string.Join(",", ordered)} (root is first)."));
         }, cancellationToken).ConfigureAwait(false);
     }
 
