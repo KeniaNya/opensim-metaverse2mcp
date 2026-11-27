@@ -914,7 +914,11 @@ internal sealed partial class BotSession
             sculpt,
             freshness,
             string.IsNullOrWhiteSpace(prim.Text) ? null : prim.Text,
-            prim.IsAttachment);
+            prim.IsAttachment,
+            // The colour and opacity the floating text is drawn in, for whoever renders it
+            string.IsNullOrWhiteSpace(prim.Text)
+                ? null
+                : new PrimTextColorInfo(prim.TextColor.R, prim.TextColor.G, prim.TextColor.B, prim.TextColor.A));
     }
 
     public async Task<BotToolResult> SelectPrimAsync(uint localId, bool automaticDeselect, CancellationToken cancellationToken)
@@ -1607,7 +1611,11 @@ internal sealed record PrimInfo(
     PrimSculptInfo? Sculpt,
     PrimPropertyFreshnessInfo Freshness,
     string? HoverText = null,
-    bool IsAttachment = false);
+    bool IsAttachment = false,
+    PrimTextColorInfo? HoverTextColor = null);
+
+// Colour of a prim's floating text, each component 0..1 (alpha 1 = opaque).
+internal sealed record PrimTextColorInfo(float R, float G, float B, float A);
 
 internal sealed record PrimShapeDetail(
     string PathCurve,
