@@ -4246,6 +4246,26 @@ internal sealed partial class BotSession
                     .ConfigureAwait(false);
             }
 
+            var permissions = Permissions.NoPermissions;
+            var uploadNote = string.Empty;
+            if (parsedAssetType == AssetType.Texture)
+            {
+                // Image files are converted here: sent as PNG or JPEG the upload comes back
+                // as "failure" (and costs nothing).
+                try
+                {
+                    data = EncodeTextureForUpload(data, source, out uploadNote);
+                }
+                catch (Exception ex)
+                {
+                    return AssetTransferResult.FailResult($"Could not convert '{source}' to JPEG 2000 for upload: {ex.Message}");
+                }
+
+                // The uploader can hand the texture on with full permissions, as a viewer
+                // upload with every "next owner" box ticked would allow.
+                permissions.NextOwnerMask = PermissionMask.All;
+            }
+
             var result = await client.Inventory
                 .RequestCreateItemFromAssetAsync(
                     data,
@@ -4254,7 +4274,7 @@ internal sealed partial class BotSession
                     parsedAssetType,
                     parsedInventoryType,
                     folderUuid,
-                    Permissions.NoPermissions,
+                    permissions,
                     token)
                 .ConfigureAwait(false);
 
@@ -4267,7 +4287,8 @@ internal sealed partial class BotSession
                 result.itemID.ToString(),
                 result.assetID.ToString(),
                 data.Length,
-                $"Uploaded {data.Length} bytes as {parsedAssetType}/{parsedInventoryType} into folder {folderUuid}.");
+                $"Uploaded {data.Length} bytes as {parsedAssetType}/{parsedInventoryType} into folder {folderUuid}"
+                    + (uploadNote.Length > 0 ? $" ({uploadNote})." : "."));
         }, cancellationToken).ConfigureAwait(false);
     }
 
