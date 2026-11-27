@@ -1835,7 +1835,7 @@ internal sealed class BotMcpTools
     [McpServerTool, Description("Set detailed texture/material parameters (colour, alpha, repeats, offsets, rotation, glow, fullbright, shiny, bump) on one face of a prim, or on every face with faceIndex -1.")]
     public Task<BotToolResult> PrimSetFaceParams(
         [Description("Prim local ID.")] uint localId,
-        [Description("Face index (0..44), or -1 for default face.")] int faceIndex,
+        [Description("Face index (0..44), or -1 for every face.")] int faceIndex,
         [Description("Optional red tint (0..1).") ] float? red = null,
         [Description("Optional green tint (0..1).") ] float? green = null,
         [Description("Optional blue tint (0..1).") ] float? blue = null,
